@@ -1,0 +1,41 @@
+{
+  "name": "queue-handle-time",
+  "description": "Compare conversation handle-time behavior by queue and track the daily trend.",
+  "source": "conversations",
+  "filters": [
+    {
+      "field": "PrimaryMediaType",
+      "operator": "eq",
+      "value": "voice"
+    },
+    {
+      "field": "HandleSec",
+      "operator": "notEmpty"
+    }
+  ],
+  "groupBy": [
+    "QueueId"
+  ],
+  "trendBy": "ConversationStartDate",
+  "metrics": [
+    {
+      "name": "ConversationCount",
+      "aggregation": "count"
+    },
+    {
+      "name": "AvgHandleSec",
+      "field": "HandleSec",
+      "aggregation": "avg"
+    },
+    {
+      "name": "P95HandleSec",
+      "field": "HandleSec",
+      "aggregation": "p95"
+    },
+    {
+      "name": "AvgTalkSec",
+      "field": "TalkSec",
+      "aggregation": "avg"
+    }
+  ]
+}

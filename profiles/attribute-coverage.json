@@ -1,0 +1,26 @@
+{
+  "name": "attribute-coverage",
+  "description": "Measure which customer or workflow attributes are most common and how their usage trends over time.",
+  "source": "attributes",
+  "filters": [
+    {
+      "field": "AttributeName",
+      "operator": "notEmpty"
+    }
+  ],
+  "groupBy": [
+    "ParticipantPurpose",
+    "AttributeName"
+  ],
+  "metrics": [
+    {
+      "name": "AttributeOccurrences",
+      "aggregation": "count"
+    },
+    {
+      "name": "DistinctConversations",
+      "field": "ConversationId",
+      "aggregation": "countDistinct"
+    }
+  ]
+}
