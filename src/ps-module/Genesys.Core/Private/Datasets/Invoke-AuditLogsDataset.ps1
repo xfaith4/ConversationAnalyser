@@ -62,7 +62,7 @@ function Invoke-AuditLogsDataset {
         [Parameter(Mandatory = $true)]
         [psobject]$Catalog,
 
-        [string]$BaseUri = 'https://api.mypurecloud.com',
+        [string]$BaseUri = 'https://api.usw2.pure.cloud',
 
         [hashtable]$Headers,
 

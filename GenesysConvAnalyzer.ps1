@@ -14,7 +14,7 @@
     - Export flattened rows (CSV) or full conversation objects (JSONL) for downstream tools
 
     The workflow is:
-        Query Builder → Submit Job → Poll Status → Collect Results → Analyze / Export
+        Query Builder > Submit Job > Poll Status > Collect Results > Analyze / Export
 
     Region validation
     -----------------
@@ -32,7 +32,7 @@
     Start time defaults to 00:00:00 when left blank; end time defaults to 23:59:59.
     Times are parsed in HH:mm or HH:mm:ss format (local time); an out-of-order or
     unparseable value raises an error before any request is built.
-    Quick-preset buttons (Today, Yesterday, Last 7 Days, …) always reset both time
+    Quick-preset buttons (Today, Yesterday, Last 7 Days, etc.) always reset both time
     boxes to 00:00:00 / 23:59:59 unconditionally, producing a deterministic full-day
     interval regardless of any value previously typed.
 
@@ -83,9 +83,9 @@ Add-Type -AssemblyName System.Windows.Forms
 
 . (Join-Path $PSScriptRoot 'src/ui/UiApiRetry.ps1')
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Config / Auth  (shared pattern with GenesysCore-GUI.ps1)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 function Resolve-UIConfigPath {
     param([string]$ExplicitPath)
@@ -126,9 +126,9 @@ function Get-ConfigString {
     return $null
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Script state
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 $script:accessToken       = $null
 $script:headers           = @{}
@@ -145,12 +145,21 @@ $script:pollCount         = 0
 $script:jobSubmitTime     = $null
 $script:allConversations  = [System.Collections.Generic.List[object]]::new()
 $script:selectedAttrCols  = [System.Collections.Generic.List[string]]::new()
+
+# -- Polling and paging guardrails ---------------------------------------------
+$script:maxPollCount              = 600    # Stop polling after this many attempts (~30 min at 3s interval)
+$script:maxPollTimeoutMinutes     = 30     # Hard timeout regardless of poll count
+$script:maxConsecutivePollErrors  = 5      # Stop after this many consecutive poll failures
+$script:consecutivePollErrors     = 0      # Running count, reset on each successful poll
+
+$script:maxPageCount              = 500    # Stop paging after this many pages (500k conversations at 1000/page)
+$script:seenCursors               = $null  # HashSet populated during collection to detect cursor loops
 $script:convFilterRows    = [System.Collections.Generic.List[pscustomobject]]::new()
 $script:segFilterRows     = [System.Collections.Generic.List[pscustomobject]]::new()
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # API helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 function Invoke-GcApiRequest {
     param(
@@ -193,9 +202,9 @@ function Get-AnalyticsJobResults {
     Invoke-GcApiRequest -Method 'GET' -Path "/api/v2/analytics/conversations/details/jobs/$JobId/results" -QueryParams $q
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Data transformation
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 function Get-ParticipantByPurpose {
     param([object]$Conv, [string]$Purpose)
@@ -300,9 +309,9 @@ function ConvertTo-FlatRow {
     return [pscustomobject]$row
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # XAML
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -339,7 +348,7 @@ function ConvertTo-FlatRow {
       <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
-    <!-- ── Auth ─────────────────────────────────────────────────── -->
+    <!-- -- Auth --------------------------------------------------- -->
     <GroupBox Grid.Row="0" Header="Authentication">
       <Grid>
         <Grid.ColumnDefinitions>
@@ -366,11 +375,11 @@ function ConvertTo-FlatRow {
       </Grid>
     </GroupBox>
 
-    <!-- ── Main Tabs ─────────────────────────────────────────────── -->
+    <!-- -- Main Tabs ----------------------------------------------- -->
     <TabControl Grid.Row="1" Name="MainTabControl">
 
-      <!-- ══ Tab 1: Query Builder ══ -->
-      <TabItem Header=" 🔍 Query Builder ">
+      <!-- == Tab 1: Query Builder == -->
+      <TabItem Header=" Query Builder ">
         <ScrollViewer VerticalScrollBarVisibility="Auto">
           <StackPanel Margin="6">
 
@@ -463,7 +472,7 @@ function ConvertTo-FlatRow {
             </GroupBox>
 
             <!-- Conversation filters -->
-            <GroupBox Header="Conversation Filters  (one predicate per row → each becomes its own filter group)">
+            <GroupBox Header="Conversation Filters  (one predicate per row - each becomes its own filter group)">
               <StackPanel>
                 <StackPanel Name="ConvFilterPanel"/>
                 <Button Name="AddConvFilterBtn" Content="+ Add Conversation Filter"
@@ -499,7 +508,7 @@ function ConvertTo-FlatRow {
             </GroupBox>
 
             <!-- Submit -->
-            <Button Name="SubmitJobBtn" Content="▶  Submit Async Job"
+            <Button Name="SubmitJobBtn" Content="Submit Async Job"
                     FontSize="13" FontWeight="Bold" Height="38"
                     Background="#005A9C" Foreground="White"
                     HorizontalContentAlignment="Center"/>
@@ -508,8 +517,8 @@ function ConvertTo-FlatRow {
         </ScrollViewer>
       </TabItem>
 
-      <!-- ══ Tab 2: Job Monitor ══ -->
-      <TabItem Header=" ⏱ Job Monitor " Name="JobMonitorTab">
+      <!-- == Tab 2: Job Monitor == -->
+      <TabItem Header=" Job Monitor " Name="JobMonitorTab">
         <Grid Margin="6">
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -562,7 +571,7 @@ function ConvertTo-FlatRow {
                          Text="Submit a job above. When it reaches FULFILLED, click Collect to page through results."
                          VerticalAlignment="Center" TextWrapping="Wrap"/>
               <Button Grid.Column="1" Name="CollectResultsBtn"
-                      Content="Collect All Results  →" FontWeight="Bold"
+                      Content="Collect All Results" FontWeight="Bold"
                       Background="#27AE60" Foreground="White"
                       IsEnabled="False" Width="180" Height="34"/>
             </Grid>
@@ -570,8 +579,8 @@ function ConvertTo-FlatRow {
         </Grid>
       </TabItem>
 
-      <!-- ══ Tab 3: Results ══ -->
-      <TabItem Header=" 📊 Results " Name="ResultsTab">
+      <!-- == Tab 3: Results == -->
+      <TabItem Header=" Results " Name="ResultsTab">
         <Grid Margin="6">
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -588,10 +597,10 @@ function ConvertTo-FlatRow {
 
           <!-- Toolbar -->
           <WrapPanel Grid.Row="1" Margin="0,0,0,4">
-            <Button Name="ColumnSelectorBtn" Content="Column Selector…"/>
+            <Button Name="ColumnSelectorBtn" Content="Column Selector..."/>
             <Button Name="ExportCsvBtn"      Content="Export CSV"/>
             <Button Name="ExportJsonlBtn"    Content="Export JSONL (full)"/>
-            <Button Name="LoadJsonlBtn"      Content="Load from JSONL…"/>
+            <Button Name="LoadJsonlBtn"      Content="Load from JSONL..."/>
             <Button Name="ClearResultsBtn"   Content="Clear Results"/>
           </WrapPanel>
 
@@ -658,18 +667,18 @@ function ConvertTo-FlatRow {
       </TabItem>
     </TabControl>
 
-    <!-- ── Status bar ──────────────────────────────────────────── -->
+    <!-- -- Status bar -------------------------------------------- -->
     <Border Grid.Row="2" Background="#F0F0F0" BorderBrush="#CCCCCC" BorderThickness="0,1,0,0" Padding="4,2">
-      <TextBlock Name="StatusText" Text="Ready — authenticate and build a query to begin."/>
+      <TextBlock Name="StatusText" Text="Ready - authenticate and build a query to begin."/>
     </Border>
 
   </Grid>
 </Window>
 '@
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Build WPF window from XAML
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 $reader = [System.Xml.XmlNodeReader]::new($xaml)
 $window = [System.Windows.Markup.XamlReader]::Load($reader)
@@ -728,9 +737,9 @@ $statusText        = Get-Control 'StatusText'
 
 $detailTabControl  = Get-Control 'DetailTabControl'
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Helpers used from event handlers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 function Set-Status { param([string]$Msg) $statusText.Text = $Msg }
 
@@ -815,7 +824,7 @@ function New-FilterRow {
     [System.Windows.Controls.Grid]::SetColumn($valTb, 3); $grid.Children.Add($valTb) | Out-Null
 
     $remBtn = New-Object System.Windows.Controls.Button
-    $remBtn.Content = '✕'; $remBtn.Margin = [System.Windows.Thickness]::new(1); $remBtn.Padding = [System.Windows.Thickness]::new(2,0,2,0)
+    $remBtn.Content = 'X'; $remBtn.Margin = [System.Windows.Thickness]::new(1); $remBtn.Padding = [System.Windows.Thickness]::new(2,0,2,0)
     $remBtn.ToolTip = 'Remove filter'
     $capturedBorder = $border; $capturedPanel = $Panel
     $remBtn.Add_Click({ $capturedPanel.Children.Remove($capturedBorder) }.GetNewClosure())
@@ -998,7 +1007,7 @@ function Build-QueryBody {
         })
     }
 
-    # Quick filter: media type → segment filter (purpose=agent + mediaType from session)
+    # Quick filter: media type -> segment filter (purpose=agent + mediaType from session)
     $mt = [string]$mediaTypeCombo.SelectedItem
     if (-not [string]::IsNullOrWhiteSpace($mt) -and $mt -ne '(any)') {
         $existing = if (Test-MapContainsKey -Map $body -Key 'segmentFilters') { [System.Collections.Generic.List[object]]$body['segmentFilters'] } else { [System.Collections.Generic.List[object]]::new() }
@@ -1059,9 +1068,9 @@ function Build-QueryRequestPreview {
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Results grid population
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 function Show-Results {
     $attrCols = @($script:selectedAttrCols)
@@ -1121,7 +1130,7 @@ function Show-Results {
 function Show-ConversationDetail {
     param([object]$Conv)
 
-    # ── Overview
+    # -- Overview
     $overviewPanel.Children.Clear()
     $fields = [ordered]@{
         'Conversation ID' = $Conv.conversationId
@@ -1156,7 +1165,7 @@ function Show-ConversationDetail {
         $overviewPanel.Children.Add($border) | Out-Null
     }
 
-    # ── Attributes (customer participant)
+    # -- Attributes (customer participant)
     $cust  = Get-ParticipantByPurpose -Conv $Conv -Purpose 'customer'
     $attrs = if ($null -ne $cust) { $cust.attributes } else { $null }
     $attrList = [System.Collections.Generic.List[pscustomobject]]::new()
@@ -1170,7 +1179,7 @@ function Show-ConversationDetail {
     }
     $attributesGrid.ItemsSource = $attrList
 
-    # ── Participants
+    # -- Participants
     $partList = [System.Collections.Generic.List[pscustomobject]]::new()
     foreach ($p in @($Conv.participants)) {
         $partList.Add([pscustomobject]@{
@@ -1183,7 +1192,7 @@ function Show-ConversationDetail {
     }
     $participantsGrid.ItemsSource = $partList
 
-    # ── Segment timeline
+    # -- Segment timeline
     $segList = [System.Collections.Generic.List[pscustomobject]]::new()
     foreach ($p in @($Conv.participants)) {
         foreach ($s in @($p.sessions)) {
@@ -1208,27 +1217,52 @@ function Show-ConversationDetail {
     }
     $segmentsGrid.ItemsSource = $segList
 
-    # ── Raw JSON
+    # -- Raw JSON
     $rawJsonBox.Text = $Conv | ConvertTo-Json -Depth 20
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DispatcherTimer (job polling — runs on UI thread, no runspace needed)
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# DispatcherTimer (job polling - runs on UI thread, no runspace needed)
+# -----------------------------------------------------------------------------
 
 $script:pollTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:pollTimer.Interval = [TimeSpan]::FromSeconds(3)
 
 $script:pollTimer.Add_Tick({
+    # -- Check guardrails before making the API call --
+    $elapsed = [DateTime]::UtcNow - $script:jobSubmitTime
+    $jobElapsedLabel.Text = $elapsed.ToString('mm\:ss')
+
+    if ($script:pollCount -ge $script:maxPollCount) {
+        $script:pollTimer.Stop()
+        $cancelJobBtn.IsEnabled = $false
+        $jobStateLabel.Text = 'STOPPED'
+        $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
+        Append-JobLog "Polling stopped: reached max poll count ($($script:maxPollCount))."
+        $collectStatusText.Text = "Polling stopped after $($script:maxPollCount) attempts. Cancel the job or try collecting manually if it completed."
+        Set-Status 'Polling stopped - max poll count reached.'
+        return
+    }
+
+    if ($elapsed.TotalMinutes -ge $script:maxPollTimeoutMinutes) {
+        $script:pollTimer.Stop()
+        $cancelJobBtn.IsEnabled = $false
+        $jobStateLabel.Text = 'TIMEOUT'
+        $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
+        Append-JobLog "Polling stopped: timeout after $($script:maxPollTimeoutMinutes) minutes."
+        $collectStatusText.Text = "Polling timed out after $($script:maxPollTimeoutMinutes) min. Cancel the job or try collecting manually if it completed."
+        Set-Status 'Polling stopped - timeout.'
+        return
+    }
+
     try {
         $status = Get-AnalyticsJobStatus -JobId $script:currentJobId
         $state  = [string]$status.state
 
         $script:pollCount++
+        $script:consecutivePollErrors = 0
         $jobStateLabel.Text = $state
         $jobPollLabel.Text  = [string]$script:pollCount
-        $elapsed = [DateTime]::UtcNow - $script:jobSubmitTime
-        $jobElapsedLabel.Text = $elapsed.ToString('mm\:ss')
 
         Append-JobLog "Poll $($script:pollCount): state=$state"
 
@@ -1252,22 +1286,26 @@ $script:pollTimer.Add_Tick({
             $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkOrange
         }
     } catch {
-        $script:pollTimer.Stop()
+        $script:consecutivePollErrors++
         $failureText = Format-UiApiFailure -Exception $_.Exception
-        Append-JobLog "Poll error: $failureText"
-        $jobStateLabel.Text = 'ERROR'
-        $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
-        $collectResultsBtn.IsEnabled = $false
-        $collectStatusText.Text = 'Polling stopped because the status request failed. Review the activity log.'
-        Set-Status 'Polling error - see log.'
+        Append-JobLog "Poll error ($($script:consecutivePollErrors)/$($script:maxConsecutivePollErrors)): $failureText"
+
+        if ($script:consecutivePollErrors -ge $script:maxConsecutivePollErrors) {
+            $script:pollTimer.Stop()
+            $jobStateLabel.Text = 'ERROR'
+            $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
+            $collectResultsBtn.IsEnabled = $false
+            $collectStatusText.Text = "Polling stopped after $($script:maxConsecutivePollErrors) consecutive errors. Review the activity log."
+            Set-Status 'Polling stopped - too many consecutive errors.'
+        }
     }
 })
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Event handlers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# -- Auth ----------------------------------------------------------------------
 
 $authButton.Add_Click({
     $region = ([string]$regionComboBox.Text).Trim()
@@ -1321,7 +1359,7 @@ $authButton.Add_Click({
     }
 })
 
-# ── Date presets ──────────────────────────────────────────────────────────────
+# -- Date presets --------------------------------------------------------------
 
 function Set-DatePreset {
     # Presets always apply the canonical full-day range: 00:00:00 start, 23:59:59 end.
@@ -1358,7 +1396,7 @@ function Set-DatePreset {
     Set-DatePreset -Start $s -End $e
 })
 
-# ── Filter rows ───────────────────────────────────────────────────────────────
+# -- Filter rows ---------------------------------------------------------------
 
 $addConvFilterBtn.Add_Click({ New-FilterRow -Type 'conversation' -Panel $convFilterPanel | Out-Null })
 $addSegFilterBtn.Add_Click({  New-FilterRow -Type 'segment'      -Panel $segFilterPanel  | Out-Null })
@@ -1372,7 +1410,7 @@ $clearFiltersBtn.Add_Click({
     $queryPreviewBox.Text          = ''
 })
 
-# ── Preview JSON ──────────────────────────────────────────────────────────────
+# -- Preview JSON --------------------------------------------------------------
 
 $previewBtn.Add_Click({
     try {
@@ -1387,7 +1425,7 @@ $previewBtn.Add_Click({
     }
 })
 
-# ── Submit job ────────────────────────────────────────────────────────────────
+# -- Submit job ----------------------------------------------------------------
 
 $submitJobBtn.Add_Click({
     if ([string]::IsNullOrWhiteSpace($script:accessToken)) {
@@ -1413,9 +1451,10 @@ $submitJobBtn.Add_Click({
 
         if ([string]::IsNullOrWhiteSpace($jobId)) { throw "No jobId in response." }
 
-        $script:currentJobId   = $jobId
-        $script:pollCount      = 0
-        $script:jobSubmitTime  = [DateTime]::UtcNow
+        $script:currentJobId          = $jobId
+        $script:pollCount             = 0
+        $script:consecutivePollErrors = 0
+        $script:jobSubmitTime         = [DateTime]::UtcNow
 
         $jobIdBox.Text         = $jobId
         $jobStateLabel.Text    = [string]$result.state
@@ -1442,7 +1481,7 @@ $submitJobBtn.Add_Click({
     }
 })
 
-# ── Cancel job ────────────────────────────────────────────────────────────────
+# -- Cancel job ----------------------------------------------------------------
 
 $cancelJobBtn.Add_Click({
     if ([string]::IsNullOrWhiteSpace($script:currentJobId)) { return }
@@ -1471,20 +1510,32 @@ $cancelJobBtn.Add_Click({
     }
 })
 
-# ── Collect results ───────────────────────────────────────────────────────────
+# -- Collect results -----------------------------------------------------------
 
 $collectResultsBtn.Add_Click({
     $collectResultsBtn.IsEnabled = $false
     $script:allConversations.Clear()
+    $script:seenCursors = [System.Collections.Generic.HashSet[string]]::new()
     $cursor = $null
     $page   = 0
 
     Append-JobLog "Collecting results from job $($script:currentJobId)..."
+    Append-JobLog "  Guardrails: max $($script:maxPageCount) pages, cursor loop detection enabled."
     Set-Status 'Collecting results...'
 
     try {
         do {
             $page++
+
+            # -- Max page guard --
+            if ($page -gt $script:maxPageCount) {
+                Append-JobLog "Collection stopped: reached max page count ($($script:maxPageCount))."
+                [System.Windows.MessageBox]::Show(
+                    "Collection stopped after $($script:maxPageCount) pages ($($script:allConversations.Count) conversations collected).`nThis is a safety limit. Results collected so far are available in the Results tab.",
+                    'Page Limit Reached', 'OK', 'Warning') | Out-Null
+                break
+            }
+
             Append-JobLog "  Page $page - cursor: $(if ($cursor) { $cursor.Substring(0, [Math]::Min(20,$cursor.Length)) + '...' } else { '(first)' })"
 
             $result = Get-AnalyticsJobResults -JobId $script:currentJobId -PageSize 1000 -Cursor $cursor
@@ -1492,13 +1543,24 @@ $collectResultsBtn.Add_Click({
             foreach ($c in $batch) { $script:allConversations.Add($c) | Out-Null }
             $cursor = [string]$result.cursor
             Append-JobLog "  Got $($batch.Count) - total so far: $($script:allConversations.Count)"
-            Set-Status "Collecting... $($script:allConversations.Count) conversations so far."
+            Set-Status "Collecting... $($script:allConversations.Count) conversations so far (page $page)."
+
+            # -- Cursor loop detection --
+            if (-not [string]::IsNullOrWhiteSpace($cursor)) {
+                if (-not $script:seenCursors.Add($cursor)) {
+                    Append-JobLog "Collection stopped: cursor loop detected (cursor repeated on page $page)."
+                    [System.Windows.MessageBox]::Show(
+                        "Collection stopped: the API returned a cursor that was already seen, indicating a loop.`n$($script:allConversations.Count) conversations collected so far are available in the Results tab.",
+                        'Cursor Loop Detected', 'OK', 'Warning') | Out-Null
+                    break
+                }
+            }
 
             # Let the UI breathe between pages
             [System.Windows.Forms.Application]::DoEvents()
         } while (-not [string]::IsNullOrWhiteSpace($cursor))
 
-        Append-JobLog "Collection complete. $($script:allConversations.Count) total conversations."
+        Append-JobLog "Collection complete. $($script:allConversations.Count) total conversations across $page pages."
         Set-Status "Collection complete: $($script:allConversations.Count) conversations."
 
         Show-Results
@@ -1506,16 +1568,24 @@ $collectResultsBtn.Add_Click({
     }
     catch {
         $failureText = Format-UiApiFailure -Exception $_.Exception
-        Append-JobLog "Collection error: $failureText"
+        Append-JobLog "Collection error on page $($page): $failureText"
         Set-Status 'Collection error - see log.'
-        [System.Windows.MessageBox]::Show("Collection failed:`n$failureText", 'Error', 'OK', 'Error') | Out-Null
+        [System.Windows.MessageBox]::Show("Collection failed on page $($page):`n$failureText", 'Error', 'OK', 'Error') | Out-Null
+
+        # Show partial results if any were collected before the error
+        if ($script:allConversations.Count -gt 0) {
+            Append-JobLog "Showing $($script:allConversations.Count) partial results collected before failure."
+            Show-Results
+            $mainTabControl.SelectedIndex = 2
+        }
     }
     finally {
+        $script:seenCursors = $null
         $collectResultsBtn.IsEnabled = $true
     }
 })
 
-# ── Results grid selection ────────────────────────────────────────────────────
+# -- Results grid selection ----------------------------------------------------
 
 $resultsGrid.Add_SelectionChanged({
     $row = $resultsGrid.SelectedItem
@@ -1526,7 +1596,7 @@ $resultsGrid.Add_SelectionChanged({
     Show-ConversationDetail -Conv $conv
 })
 
-# ── Column selector ───────────────────────────────────────────────────────────
+# -- Column selector -----------------------------------------------------------
 
 $columnSelectorBtn.Add_Click({
     $allKeys = Get-AllAttributeKeys
@@ -1603,7 +1673,7 @@ $columnSelectorBtn.Add_Click({
     $popup.ShowDialog() | Out-Null
 })
 
-# ── Export CSV ────────────────────────────────────────────────────────────────
+# -- Export CSV ----------------------------------------------------------------
 
 $exportCsvBtn.Add_Click({
     if ($script:allConversations.Count -eq 0) {
@@ -1626,7 +1696,7 @@ $exportCsvBtn.Add_Click({
     }
 })
 
-# ── Export JSONL ──────────────────────────────────────────────────────────────
+# -- Export JSONL --------------------------------------------------------------
 
 $exportJsonlBtn.Add_Click({
     if ($script:allConversations.Count -eq 0) {
@@ -1651,7 +1721,7 @@ $exportJsonlBtn.Add_Click({
     }
 })
 
-# ── Load from JSONL ───────────────────────────────────────────────────────────
+# -- Load from JSONL -----------------------------------------------------------
 
 $loadJsonlBtn.Add_Click({
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
@@ -1687,7 +1757,7 @@ $loadJsonlBtn.Add_Click({
     }
 })
 
-# ── Clear results ─────────────────────────────────────────────────────────────
+# -- Clear results -------------------------------------------------------------
 
 $clearResultsBtn.Add_Click({
     $script:allConversations.Clear()
@@ -1702,9 +1772,9 @@ $clearResultsBtn.Add_Click({
     Set-Status 'Results cleared.'
 })
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Startup: load persisted config + auto-auth
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 $startDatePicker.SelectedDate = [DateTime]::Today
 $endDatePicker.SelectedDate   = [DateTime]::Today
@@ -1729,8 +1799,8 @@ if (-not [string]::IsNullOrWhiteSpace([string]$clientIdBox.Text) -and -not [stri
     $authButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Show
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 $window.ShowDialog() | Out-Null
