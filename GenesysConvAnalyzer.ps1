@@ -55,7 +55,6 @@
 
 .NOTES
     Requirements : Windows, PowerShell 5.1+, Genesys Cloud OAuth client credentials
-    Depends on   : Genesys.Core module (src/ps-module/Genesys.Core)
     Reuses       : Auth + config patterns from GenesysCore-GUI.ps1
 
 .EXAMPLE
@@ -68,7 +67,6 @@
 [CmdletBinding()]
 param(
     [string]$DefaultRegion = 'usw2.pure.cloud',
-    [string]$ModulePath    = "$PSScriptRoot/src/ps-module/Genesys.Core/Genesys.Core.psd1",
     [string]$ConfigPath
 )
 
@@ -143,8 +141,11 @@ $script:currentJobId      = $null
 $script:pollTimer         = $null
 $script:pollCount         = 0
 $script:jobSubmitTime     = $null
-$script:allConversations  = [System.Collections.Generic.List[object]]::new()
-$script:selectedAttrCols  = [System.Collections.Generic.List[string]]::new()
+$script:allConversations     = [System.Collections.Generic.List[object]]::new()
+$script:conversationIndex   = @{}
+$script:selectedAttrCols    = [System.Collections.Generic.List[string]]::new()
+$script:maxGridRows         = 20000  # Display cap to keep the WPF grid responsive on large jobs
+$script:exportRedactionMode = $true  # Safe-by-default export behavior
 
 # -- Polling and paging guardrails ---------------------------------------------
 $script:maxPollCount              = 600    # Stop polling after this many attempts (~30 min at 3s interval)
@@ -253,6 +254,7 @@ function Get-AllAttributeKeys {
     return @($keys | Sort-Object)
 }
 
+
 function ConvertTo-FlatRow {
     param([object]$Conv, [string[]]$AttrCols)
 
@@ -307,6 +309,169 @@ function ConvertTo-FlatRow {
     }
 
     return [pscustomobject]$row
+}
+
+function Clear-ConversationStore {
+    $script:allConversations.Clear()
+    $script:conversationIndex = @{}
+}
+
+function Add-ConversationRecord {
+    param([object]$Conversation)
+    if ($null -eq $Conversation) { return }
+    $script:allConversations.Add($Conversation) | Out-Null
+    $conversationId = [string]$Conversation.conversationId
+    if (-not [string]::IsNullOrWhiteSpace($conversationId)) {
+        $script:conversationIndex[$conversationId] = $Conversation
+    }
+}
+
+function Add-Conversations {
+    param([object[]]$Conversations)
+    foreach ($conversation in @($Conversations)) {
+        Add-ConversationRecord -Conversation $conversation
+    }
+}
+
+function Get-ConversationById {
+    param([string]$ConversationId)
+    if ([string]::IsNullOrWhiteSpace($ConversationId)) { return $null }
+    if ($script:conversationIndex.ContainsKey($ConversationId)) {
+        return $script:conversationIndex[$ConversationId]
+    }
+    return $null
+}
+
+function Test-SensitiveKey {
+    param([string]$Key)
+    if ([string]::IsNullOrWhiteSpace($Key)) { return $false }
+    return $Key -match '(?i)(password|secret|token|ani|dnis|phone|email|address|ssn|externalContactId|participantName|firstName|lastName|fullName|displayName)'
+}
+
+function Protect-ScalarValue {
+    param([AllowNull()][object]$Value, [string]$Key)
+    if ($null -eq $Value) { return $null }
+    if (-not $script:exportRedactionMode) { return $Value }
+    if (-not (Test-SensitiveKey -Key $Key)) { return $Value }
+
+    $text = [string]$Value
+    if ([string]::IsNullOrEmpty($text)) { return $text }
+    if ($text.Length -le 4) { return ('*' * $text.Length) }
+    return ('*' * ($text.Length - 4)) + $text.Substring($text.Length - 4)
+}
+
+function Protect-ObjectForExport {
+    param(
+        [AllowNull()][object]$InputObject,
+        [string]$CurrentKey = ''
+    )
+
+    if ($null -eq $InputObject) { return $null }
+
+    if ($InputObject -is [string] -or $InputObject -is [ValueType]) {
+        return (Protect-ScalarValue -Value $InputObject -Key $CurrentKey)
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $clone = [ordered]@{}
+        foreach ($key in $InputObject.Keys) {
+            $clone[[string]$key] = Protect-ObjectForExport -InputObject $InputObject[$key] -CurrentKey ([string]$key)
+        }
+        return [pscustomobject]$clone
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
+        $items = New-Object System.Collections.Generic.List[object]
+        foreach ($item in $InputObject) {
+            $items.Add((Protect-ObjectForExport -InputObject $item -CurrentKey $CurrentKey)) | Out-Null
+        }
+        return @($items)
+    }
+
+    $properties = $InputObject.PSObject.Properties
+    if ($null -eq $properties -or $properties.Count -eq 0) {
+        return (Protect-ScalarValue -Value $InputObject -Key $CurrentKey)
+    }
+
+    $clone = [ordered]@{}
+    foreach ($property in $properties) {
+        if ($property.IsGettable) {
+            $clone[$property.Name] = Protect-ObjectForExport -InputObject $property.Value -CurrentKey $property.Name
+        }
+    }
+    return [pscustomobject]$clone
+}
+
+function Get-ExportConversation {
+    param([object]$Conversation)
+    if (-not $script:exportRedactionMode) { return $Conversation }
+    return Protect-ObjectForExport -InputObject $Conversation
+}
+
+function Read-ConversationsFromFile {
+    param([string]$Path)
+
+    $reader = $null
+    try {
+        $reader = [System.IO.StreamReader]::new($Path)
+        $firstNonWhitespace = $null
+        while (-not $reader.EndOfStream) {
+            $charCode = $reader.Read()
+            if ($charCode -lt 0) { break }
+            $candidate = [char]$charCode
+            if (-not [char]::IsWhiteSpace($candidate)) {
+                $firstNonWhitespace = $candidate
+                break
+            }
+        }
+    }
+    finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+    }
+
+    if ($firstNonWhitespace -eq '[') {
+        $payload = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        return @($payload)
+    }
+
+    if ($firstNonWhitespace -eq '{') {
+        $payload = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        try {
+            $parsed = $payload | ConvertFrom-Json
+            if ($parsed -is [System.Collections.IEnumerable] -and $parsed -isnot [string]) { return @($parsed) }
+            if ($parsed.PSObject.Properties.Name -contains 'conversations') { return @($parsed.conversations) }
+            if ($parsed.PSObject.Properties.Name -contains 'conversationId') { return @($parsed) }
+        }
+        catch {
+            # Fall through to line-by-line JSONL processing.
+        }
+    }
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $stream = $null
+    try {
+        $stream = [System.IO.StreamReader]::new($Path)
+        while (-not $stream.EndOfStream) {
+            $line = $stream.ReadLine()
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $trimmed = $line.Trim()
+            $obj = $trimmed | ConvertFrom-Json
+            if ($obj -is [System.Collections.IEnumerable] -and $obj -isnot [string]) {
+                foreach ($entry in @($obj)) { $results.Add($entry) | Out-Null }
+                continue
+            }
+            if ($obj.PSObject.Properties.Name -contains 'conversations') {
+                foreach ($entry in @($obj.conversations)) { $results.Add($entry) | Out-Null }
+                continue
+            }
+            $results.Add($obj) | Out-Null
+        }
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+
+    return @($results)
 }
 
 # -----------------------------------------------------------------------------
@@ -602,6 +767,7 @@ function ConvertTo-FlatRow {
             <Button Name="ExportJsonlBtn"    Content="Export JSONL (full)"/>
             <Button Name="LoadJsonlBtn"      Content="Load from JSONL..."/>
             <Button Name="ClearResultsBtn"   Content="Clear Results"/>
+            <CheckBox Name="RedactExportsCheckBox" Content="Redact exports" IsChecked="True" VerticalAlignment="Center" Margin="8,2,2,2"/>
           </WrapPanel>
 
           <!-- Results DataGrid -->
@@ -727,6 +893,7 @@ $exportCsvBtn      = Get-Control 'ExportCsvBtn'
 $exportJsonlBtn    = Get-Control 'ExportJsonlBtn'
 $loadJsonlBtn      = Get-Control 'LoadJsonlBtn'
 $clearResultsBtn   = Get-Control 'ClearResultsBtn'
+$redactExportsCheckBox = Get-Control 'RedactExportsCheckBox'
 $resultsGrid       = Get-Control 'ResultsGrid'
 $overviewPanel     = Get-Control 'OverviewPanel'
 $attributesGrid    = Get-Control 'AttributesGrid'
@@ -736,6 +903,10 @@ $rawJsonBox        = Get-Control 'RawJsonBox'
 $statusText        = Get-Control 'StatusText'
 
 $detailTabControl  = Get-Control 'DetailTabControl'
+
+$script:exportRedactionMode = [bool]$redactExportsCheckBox.IsChecked
+$redactExportsCheckBox.Add_Checked({ $script:exportRedactionMode = $true })
+$redactExportsCheckBox.Add_Unchecked({ $script:exportRedactionMode = $false })
 
 # -----------------------------------------------------------------------------
 # Helpers used from event handlers
@@ -1074,56 +1245,43 @@ function Build-QueryRequestPreview {
 
 function Show-Results {
     $attrCols = @($script:selectedAttrCols)
-    $dt       = New-Object System.Data.DataTable
-
-    # Base columns (always shown)
-    @('ConversationId','Start','End','DurationSec','Direction','MediaType','QueueId',
-      'AgentName','AgentUserId','tHandleSec','tTalkSec','tAcwSec','tHeldSec','nConnected') |
-        ForEach-Object { $dt.Columns.Add($_) | Out-Null }
-
-    foreach ($col in $attrCols) { $dt.Columns.Add("A:$col") | Out-Null }
+    $displayRows = New-Object System.Collections.Generic.List[object]
+    $displayCount = 0
 
     foreach ($conv in @($script:allConversations)) {
-        $flat   = ConvertTo-FlatRow -Conv $conv -AttrCols $attrCols
-        $dtRow  = $dt.NewRow()
-        foreach ($col in $dt.Columns) {
-            $cn = $col.ColumnName
-            $dtRow[$cn] = if ($flat.PSObject.Properties.Name -contains $cn -and $null -ne $flat.$cn) { [string]$flat.$cn } else { '' }
-        }
-        $dt.Rows.Add($dtRow) | Out-Null
+        if ($displayCount -ge $script:maxGridRows) { break }
+        $displayRows.Add((ConvertTo-FlatRow -Conv $conv -AttrCols $attrCols)) | Out-Null
+        $displayCount++
     }
 
-    # Rebuild DataGrid columns
     $resultsGrid.Columns.Clear()
-    foreach ($col in $dt.Columns) {
-        $dgc = New-Object System.Windows.Controls.DataGridTextColumn
-        $dgc.Header  = $col.ColumnName
-        $dgc.Binding = New-Object System.Windows.Data.Binding($col.ColumnName)
-        if ($col.ColumnName -eq 'ConversationId') { $dgc.Width = 300 }
-        $resultsGrid.Columns.Add($dgc) | Out-Null
+    $columnNames = @('ConversationId','Start','End','DurationSec','Direction','MediaType','QueueId','AgentName','AgentUserId','tHandleSec','tTalkSec','tAcwSec','tHeldSec','nConnected') + @($attrCols | ForEach-Object { "A:$_" })
+    foreach ($columnName in $columnNames) {
+        $column = New-Object System.Windows.Controls.DataGridTextColumn
+        $column.Header = $columnName
+        $column.Binding = New-Object System.Windows.Data.Binding($columnName)
+        if ($columnName -eq 'ConversationId') { $column.Width = 300 }
+        $resultsGrid.Columns.Add($column) | Out-Null
     }
 
-    $resultsGrid.ItemsSource = $dt.DefaultView
+    $resultsGrid.ItemsSource = @($displayRows)
 
-    # Summary stats
-    $total    = $script:allConversations.Count
-    $byMedia = $script:allConversations |
-    Group-Object {
-        $agent = $_.participants | Where-Object { $_.purpose -eq 'agent' } | Select-Object -First 1
-        if ($null -ne $agent -and $null -ne $agent.sessions -and @($agent.sessions).Count -gt 0) {
-            [string]$agent.sessions[0].mediaType
-        }
-        else {
-            ''
-        }
-    } |
-    Sort-Object Count -Descending |
-    ForEach-Object { "$($_.Name): $($_.Count)" }
-                    Sort-Object Count -Descending | ForEach-Object { "$($_.Name): $($_.Count)" }
-    $inbound  = ($script:allConversations | Where-Object { $_.originatingDirection -eq 'inbound'  }).Count
-    $outbound = ($script:allConversations | Where-Object { $_.originatingDirection -eq 'outbound' }).Count
+    $total = $script:allConversations.Count
+    $inbound = (@($script:allConversations | Where-Object { $_.originatingDirection -eq 'inbound' })).Count
+    $outbound = (@($script:allConversations | Where-Object { $_.originatingDirection -eq 'outbound' })).Count
+    $byMedia = @($script:allConversations |
+        ForEach-Object { ConvertTo-FlatRow -Conv $_ -AttrCols @() } |
+        Group-Object MediaType |
+        Sort-Object Count -Descending |
+        ForEach-Object { if ([string]::IsNullOrWhiteSpace($_.Name)) { "(blank): $($_.Count)" } else { "$($_.Name): $($_.Count)" } })
 
-    $summaryText.Text = "Loaded $total conversations  |  Inbound: $inbound  Outbound: $outbound  |  $($byMedia -join '  |  ')"
+    $displayNotice = if ($total -gt $displayCount) {
+        "  |  Grid showing first $displayCount of $total rows to keep the UI responsive. Exports still include all loaded conversations."
+    } else {
+        ''
+    }
+
+    $summaryText.Text = "Loaded $total conversations  |  Inbound: $inbound  Outbound: $outbound  |  $($byMedia -join '  |  ')$displayNotice"
     Set-Status "Results loaded: $total conversations."
 }
 
@@ -1514,7 +1672,7 @@ $cancelJobBtn.Add_Click({
 
 $collectResultsBtn.Add_Click({
     $collectResultsBtn.IsEnabled = $false
-    $script:allConversations.Clear()
+    Clear-ConversationStore
     $script:seenCursors = [System.Collections.Generic.HashSet[string]]::new()
     $cursor = $null
     $page   = 0
@@ -1540,7 +1698,7 @@ $collectResultsBtn.Add_Click({
 
             $result = Get-AnalyticsJobResults -JobId $script:currentJobId -PageSize 1000 -Cursor $cursor
             $batch  = @($result.conversations)
-            foreach ($c in $batch) { $script:allConversations.Add($c) | Out-Null }
+            Add-Conversations -Conversations $batch
             $cursor = [string]$result.cursor
             Append-JobLog "  Got $($batch.Count) - total so far: $($script:allConversations.Count)"
             Set-Status "Collecting... $($script:allConversations.Count) conversations so far (page $page)."
@@ -1590,8 +1748,8 @@ $collectResultsBtn.Add_Click({
 $resultsGrid.Add_SelectionChanged({
     $row = $resultsGrid.SelectedItem
     if ($null -eq $row) { return }
-    $convId = [string]($row['ConversationId'])
-    $conv   = @($script:allConversations | Where-Object { [string]$_.conversationId -eq $convId }) | Select-Object -First 1
+    $convId = [string]$row.ConversationId
+    $conv   = Get-ConversationById -ConversationId $convId
     if ($null -eq $conv) { return }
     Show-ConversationDetail -Conv $conv
 })
@@ -1686,10 +1844,19 @@ $exportCsvBtn.Add_Click({
 
     try {
         $attrCols = @($script:selectedAttrCols)
-        $rows = @($script:allConversations | ForEach-Object { ConvertTo-FlatRow -Conv $_ -AttrCols $attrCols })
-        $rows | Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding UTF8
-        Set-Status "Exported $($rows.Count) rows to $($dlg.FileName)"
-        [System.Windows.MessageBox]::Show("Exported $($rows.Count) conversations to:`n$($dlg.FileName)", 'Export Complete', 'OK', 'Information') | Out-Null
+        $script:allConversations |
+            ForEach-Object {
+                $row = ConvertTo-FlatRow -Conv $_ -AttrCols $attrCols
+                if ($script:exportRedactionMode) {
+                    foreach ($property in @($row.PSObject.Properties)) {
+                        $property.Value = Protect-ScalarValue -Value $property.Value -Key $property.Name
+                    }
+                }
+                $row
+            } |
+            Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding UTF8
+        Set-Status "Exported $($script:allConversations.Count) rows to $($dlg.FileName)"
+        [System.Windows.MessageBox]::Show("Exported $($script:allConversations.Count) conversations to:`n$($dlg.FileName)", 'Export Complete', 'OK', 'Information') | Out-Null
     }
     catch {
         [System.Windows.MessageBox]::Show("Export failed:`n$($_.Exception.Message)", 'Export Error', 'OK', 'Error') | Out-Null
@@ -1707,17 +1874,20 @@ $exportJsonlBtn.Add_Click({
     $dlg.FileName = "conversations-$(Get-Date -Format 'yyyyMMdd-HHmmss').jsonl"
     if ($dlg.ShowDialog() -ne 'OK') { return }
 
+    $writer = $null
     try {
-        $sw = [System.IO.StreamWriter]::new($dlg.FileName, $false, [System.Text.Encoding]::UTF8)
+        $writer = [System.IO.StreamWriter]::new($dlg.FileName, $false, [System.Text.Encoding]::UTF8)
         foreach ($conv in @($script:allConversations)) {
-            $sw.WriteLine(($conv | ConvertTo-Json -Depth 20 -Compress))
+            $writer.WriteLine(((Get-ExportConversation -Conversation $conv) | ConvertTo-Json -Depth 20 -Compress))
         }
-        $sw.Close()
         Set-Status "Exported $($script:allConversations.Count) conversations (JSONL) to $($dlg.FileName)"
         [System.Windows.MessageBox]::Show("Exported $($script:allConversations.Count) conversations to:`n$($dlg.FileName)", 'Export Complete', 'OK', 'Information') | Out-Null
     }
     catch {
         [System.Windows.MessageBox]::Show("Export failed:`n$($_.Exception.Message)", 'Export Error', 'OK', 'Error') | Out-Null
+    }
+    finally {
+        if ($null -ne $writer) { $writer.Dispose() }
     }
 })
 
@@ -1730,22 +1900,9 @@ $loadJsonlBtn.Add_Click({
     if ($dlg.ShowDialog() -ne 'OK') { return }
 
     try {
-        $script:allConversations.Clear()
+        Clear-ConversationStore
         Set-Status "Loading $($dlg.FileName)..."
-
-        $lines = [System.IO.File]::ReadAllLines($dlg.FileName)
-        foreach ($line in $lines) {
-            $trimmed = $line.Trim()
-            if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
-            $obj = $trimmed | ConvertFrom-Json
-            # Support both top-level array and JSONL objects
-            if ($obj -is [System.Object[]] -or ($obj.PSObject.Properties.Name -contains 'conversations')) {
-                $convList = if ($obj.PSObject.Properties.Name -contains 'conversations') { $obj.conversations } else { $obj }
-                foreach ($c in @($convList)) { $script:allConversations.Add($c) | Out-Null }
-            } else {
-                $script:allConversations.Add($obj) | Out-Null
-            }
-        }
+        Add-Conversations -Conversations (Read-ConversationsFromFile -Path $dlg.FileName)
 
         Show-Results
         $mainTabControl.SelectedIndex = 2
@@ -1760,7 +1917,7 @@ $loadJsonlBtn.Add_Click({
 # -- Clear results -------------------------------------------------------------
 
 $clearResultsBtn.Add_Click({
-    $script:allConversations.Clear()
+    Clear-ConversationStore
     $resultsGrid.ItemsSource = $null
     $resultsGrid.Columns.Clear()
     $summaryText.Text = 'Results cleared.'
