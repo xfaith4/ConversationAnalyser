@@ -409,69 +409,116 @@ function Get-ExportConversation {
 }
 
 function Read-ConversationsFromFile {
-    param([string]$Path)
+    # Streams conversations from a JSONL, JSON array, or single-object JSON file.
+    # Returns a result object with .Conversations (list), .LineCount, .ErrorCount,
+    # and .Errors (list of per-line error descriptions).
+    # Accepts an optional -OnProgress scriptblock that receives a hashtable with
+    # Count and LineNumber keys, called every 500 records for UI feedback.
+    param(
+        [string]$Path,
+        [scriptblock]$OnProgress = $null
+    )
 
-    $reader = $null
-    try {
-        $reader = [System.IO.StreamReader]::new($Path)
-        $firstNonWhitespace = $null
-        while (-not $reader.EndOfStream) {
-            $charCode = $reader.Read()
-            if ($charCode -lt 0) { break }
-            $candidate = [char]$charCode
-            if (-not [char]::IsWhiteSpace($candidate)) {
-                $firstNonWhitespace = $candidate
-                break
+    $conversations = [System.Collections.Generic.List[object]]::new()
+    $errors        = [System.Collections.Generic.List[string]]::new()
+    $lineNumber    = 0
+    $progressInterval = 500
+
+    function Report-Progress {
+        if ($null -ne $OnProgress) {
+            try { & $OnProgress @{ Count = $conversations.Count; LineNumber = $lineNumber } } catch {}
+        }
+    }
+
+    function Add-ParsedObject {
+        param([object]$Obj)
+        if ($null -eq $Obj) { return }
+        if ($Obj -is [System.Collections.IEnumerable] -and $Obj -isnot [string]) {
+            foreach ($entry in @($Obj)) {
+                $conversations.Add($entry) | Out-Null
             }
+            return
+        }
+        if ($Obj.PSObject.Properties.Name -contains 'conversations') {
+            foreach ($entry in @($Obj.conversations)) {
+                $conversations.Add($entry) | Out-Null
+            }
+            return
+        }
+        $conversations.Add($Obj) | Out-Null
+    }
+
+    # Peek at first non-whitespace character to detect format
+    $firstChar = $null
+    $reader    = $null
+    try {
+        $reader = [System.IO.StreamReader]::new($Path, [System.Text.Encoding]::UTF8, $true)
+        while (-not $reader.EndOfStream) {
+            $code = $reader.Read()
+            if ($code -lt 0) { break }
+            $ch = [char]$code
+            if (-not [char]::IsWhiteSpace($ch)) { $firstChar = $ch; break }
         }
     }
     finally {
         if ($null -ne $reader) { $reader.Dispose() }
     }
 
-    if ($firstNonWhitespace -eq '[') {
-        $payload = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
-        return @($payload)
+    if ($null -eq $firstChar) {
+        # Empty file
+        return [pscustomobject]@{ Conversations = @(); LineCount = 0; ErrorCount = 0; Errors = @() }
     }
 
-    if ($firstNonWhitespace -eq '{') {
-        $payload = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+    # JSON array: must read whole file because ConvertFrom-Json needs the complete array.
+    # This is the only non-streaming path; kept for backwards compatibility with JSON exports.
+    if ($firstChar -eq '[') {
         try {
-            $parsed = $payload | ConvertFrom-Json
-            if ($parsed -is [System.Collections.IEnumerable] -and $parsed -isnot [string]) { return @($parsed) }
-            if ($parsed.PSObject.Properties.Name -contains 'conversations') { return @($parsed.conversations) }
-            if ($parsed.PSObject.Properties.Name -contains 'conversationId') { return @($parsed) }
+            $payload = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+            Add-ParsedObject -Obj $payload
         }
         catch {
-            # Fall through to line-by-line JSONL processing.
+            $errors.Add("JSON array parse failed: $($_.Exception.Message)") | Out-Null
+        }
+        return [pscustomobject]@{
+            Conversations = @($conversations)
+            LineCount     = 1
+            ErrorCount    = $errors.Count
+            Errors        = @($errors)
         }
     }
 
-    $results = New-Object System.Collections.Generic.List[object]
+    # Line-by-line streaming (JSONL or single-object JSON that failed whole-file parse)
     $stream = $null
     try {
-        $stream = [System.IO.StreamReader]::new($Path)
+        $stream = [System.IO.StreamReader]::new($Path, [System.Text.Encoding]::UTF8, $true)
         while (-not $stream.EndOfStream) {
             $line = $stream.ReadLine()
+            $lineNumber++
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
-            $trimmed = $line.Trim()
-            $obj = $trimmed | ConvertFrom-Json
-            if ($obj -is [System.Collections.IEnumerable] -and $obj -isnot [string]) {
-                foreach ($entry in @($obj)) { $results.Add($entry) | Out-Null }
-                continue
+
+            try {
+                $obj = $line.Trim() | ConvertFrom-Json
+                Add-ParsedObject -Obj $obj
             }
-            if ($obj.PSObject.Properties.Name -contains 'conversations') {
-                foreach ($entry in @($obj.conversations)) { $results.Add($entry) | Out-Null }
-                continue
+            catch {
+                $errors.Add("Line $lineNumber : $($_.Exception.Message)") | Out-Null
             }
-            $results.Add($obj) | Out-Null
+
+            if ($conversations.Count % $progressInterval -eq 0) { Report-Progress }
         }
     }
     finally {
         if ($null -ne $stream) { $stream.Dispose() }
     }
 
-    return @($results)
+    Report-Progress
+
+    return [pscustomobject]@{
+        Conversations = @($conversations)
+        LineCount     = $lineNumber
+        ErrorCount    = $errors.Count
+        Errors        = @($errors)
+    }
 }
 
 # -----------------------------------------------------------------------------
@@ -1244,6 +1291,19 @@ function Build-QueryRequestPreview {
 # -----------------------------------------------------------------------------
 
 function Show-Results {
+    $total = $script:allConversations.Count
+
+    # Warn before rendering if the dataset is large enough to cause visible UI lag
+    if ($total -gt 10000) {
+        $answer = [System.Windows.MessageBox]::Show(
+            "This dataset contains $total conversations. Rendering the grid may take a moment and the UI will be unresponsive during that time.`n`nContinue?",
+            'Large Dataset', 'YesNo', 'Warning')
+        if ($answer -ne 'Yes') {
+            Set-Status "Render cancelled. $total conversations remain in memory - exports are still available."
+            return
+        }
+    }
+
     $attrCols = @($script:selectedAttrCols)
     $displayRows = New-Object System.Collections.Generic.List[object]
     $displayCount = 0
@@ -1266,14 +1326,26 @@ function Show-Results {
 
     $resultsGrid.ItemsSource = @($displayRows)
 
-    $total = $script:allConversations.Count
-    $inbound = (@($script:allConversations | Where-Object { $_.originatingDirection -eq 'inbound' })).Count
-    $outbound = (@($script:allConversations | Where-Object { $_.originatingDirection -eq 'outbound' })).Count
-    $byMedia = @($script:allConversations |
-        ForEach-Object { ConvertTo-FlatRow -Conv $_ -AttrCols @() } |
-        Group-Object MediaType |
-        Sort-Object Count -Descending |
-        ForEach-Object { if ([string]::IsNullOrWhiteSpace($_.Name)) { "(blank): $($_.Count)" } else { "$($_.Name): $($_.Count)" } })
+    # Single-pass summary: count direction and media type in one loop instead of
+    # three separate pipeline passes plus a full ConvertTo-FlatRow per conversation.
+    $total    = $script:allConversations.Count
+    $inbound  = 0
+    $outbound = 0
+    $mediaCounts = @{}
+    foreach ($conv in $script:allConversations) {
+        $dir = [string]$conv.originatingDirection
+        if ($dir -eq 'inbound')  { $inbound++ }
+        elseif ($dir -eq 'outbound') { $outbound++ }
+
+        $mt = ''
+        $agent = $conv.participants | Where-Object { $_.purpose -eq 'agent' } | Select-Object -First 1
+        if ($null -ne $agent -and $null -ne $agent.sessions -and @($agent.sessions).Count -gt 0) {
+            $mt = [string]$agent.sessions[0].mediaType
+        }
+        if ([string]::IsNullOrWhiteSpace($mt)) { $mt = '(blank)' }
+        if ($mediaCounts.ContainsKey($mt)) { $mediaCounts[$mt]++ } else { $mediaCounts[$mt] = 1 }
+    }
+    $byMedia = @($mediaCounts.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { "$($_.Key): $($_.Value)" })
 
     $displayNotice = if ($total -gt $displayCount) {
         "  |  Grid showing first $displayCount of $total rows to keep the UI responsive. Exports still include all loaded conversations."
@@ -1902,11 +1974,30 @@ $loadJsonlBtn.Add_Click({
     try {
         Clear-ConversationStore
         Set-Status "Loading $($dlg.FileName)..."
-        Add-Conversations -Conversations (Read-ConversationsFromFile -Path $dlg.FileName)
+
+        $progressAction = {
+            param([hashtable]$Info)
+            Set-Status "Loading... $($Info.Count) conversations read (line $($Info.LineNumber))."
+            [System.Windows.Forms.Application]::DoEvents()
+        }.GetNewClosure()
+
+        $loadResult = Read-ConversationsFromFile -Path $dlg.FileName -OnProgress $progressAction
+        Add-Conversations -Conversations $loadResult.Conversations
+
+        # Report any per-line parse errors
+        if ($loadResult.ErrorCount -gt 0) {
+            $preview = ($loadResult.Errors | Select-Object -First 5) -join "`n"
+            $moreNote = if ($loadResult.ErrorCount -gt 5) { "`n... and $($loadResult.ErrorCount - 5) more." } else { '' }
+            [System.Windows.MessageBox]::Show(
+                "$($loadResult.ErrorCount) lines could not be parsed and were skipped:`n`n$preview$moreNote",
+                'Partial Load Warnings', 'OK', 'Warning') | Out-Null
+        }
 
         Show-Results
         $mainTabControl.SelectedIndex = 2
-        Set-Status "Loaded $($script:allConversations.Count) conversations from file."
+
+        $errorSuffix = if ($loadResult.ErrorCount -gt 0) { " ($($loadResult.ErrorCount) lines skipped)" } else { '' }
+        Set-Status "Loaded $($script:allConversations.Count) conversations from file.$errorSuffix"
     }
     catch {
         [System.Windows.MessageBox]::Show("Load failed:`n$($_.Exception.Message)", 'Load Error', 'OK', 'Error') | Out-Null
