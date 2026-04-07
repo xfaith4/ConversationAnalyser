@@ -128,35 +128,35 @@ function Get-ConfigString {
 # Script state
 # -----------------------------------------------------------------------------
 
-$script:accessToken       = $null
-$script:headers           = @{}
-$script:baseUri           = "https://api.$DefaultRegion"
+$script:accessToken = $null
+$script:headers = @{}
+$script:baseUri = "https://api.$DefaultRegion"
 $script:gcApiRetrySettings = Resolve-UiApiRetrySettings
 $script:gcApiRequestInvoker = {
     param([hashtable]$InvokeParams)
     Invoke-RestMethod @InvokeParams
 }
 $script:gcApiRetryLogAction = $null
-$script:currentJobId      = $null
-$script:pollTimer         = $null
-$script:pollCount         = 0
-$script:jobSubmitTime     = $null
-$script:allConversations     = [System.Collections.Generic.List[object]]::new()
-$script:conversationIndex   = @{}
-$script:selectedAttrCols    = [System.Collections.Generic.List[string]]::new()
-$script:maxGridRows         = 20000  # Display cap to keep the WPF grid responsive on large jobs
+$script:currentJobId = $null
+$script:pollTimer = $null
+$script:pollCount = 0
+$script:jobSubmitTime = $null
+$script:allConversations = [System.Collections.Generic.List[object]]::new()
+$script:conversationIndex = @{}
+$script:selectedAttrCols = [System.Collections.Generic.List[string]]::new()
+$script:maxGridRows = 20000  # Display cap to keep the WPF grid responsive on large jobs
 $script:exportRedactionMode = $true  # Safe-by-default export behavior
 
 # -- Polling and paging guardrails ---------------------------------------------
-$script:maxPollCount              = 600    # Stop polling after this many attempts (~30 min at 3s interval)
-$script:maxPollTimeoutMinutes     = 30     # Hard timeout regardless of poll count
-$script:maxConsecutivePollErrors  = 5      # Stop after this many consecutive poll failures
-$script:consecutivePollErrors     = 0      # Running count, reset on each successful poll
+$script:maxPollCount = 600    # Stop polling after this many attempts (~30 min at 3s interval)
+$script:maxPollTimeoutMinutes = 30     # Hard timeout regardless of poll count
+$script:maxConsecutivePollErrors = 5      # Stop after this many consecutive poll failures
+$script:consecutivePollErrors = 0      # Running count, reset on each successful poll
 
-$script:maxPageCount              = 500    # Stop paging after this many pages (500k conversations at 1000/page)
-$script:seenCursors               = $null  # HashSet populated during collection to detect cursor loops
-$script:convFilterRows    = [System.Collections.Generic.List[pscustomobject]]::new()
-$script:segFilterRows     = [System.Collections.Generic.List[pscustomobject]]::new()
+$script:maxPageCount = 500    # Stop paging after this many pages (500k conversations at 1000/page)
+$script:seenCursors = $null  # HashSet populated during collection to detect cursor loops
+$script:convFilterRows = [System.Collections.Generic.List[pscustomobject]]::new()
+$script:segFilterRows = [System.Collections.Generic.List[pscustomobject]]::new()
 
 # -----------------------------------------------------------------------------
 # API helpers
@@ -173,15 +173,16 @@ function Invoke-GcApiRequest {
 
     $effectiveInvoker = if ($PSBoundParameters.ContainsKey('RequestInvoker') -and $null -ne $RequestInvoker) {
         $RequestInvoker
-    } else {
+    }
+    else {
         $script:gcApiRequestInvoker
     }
 
     return Invoke-UiApiRequest -BaseUri $script:baseUri -Method $Method -Path $Path -Headers $script:headers -Body $Body -QueryParams $QueryParams -RetrySettings $script:gcApiRetrySettings -RequestInvoker $effectiveInvoker -LogAction $script:gcApiRetryLogAction
 }
 
-function Submit-AnalyticsJob   { param([string]$JsonBody) Invoke-GcApiRequest -Method 'POST' -Path '/api/v2/analytics/conversations/details/jobs' -Body $JsonBody }
-function Get-AnalyticsJobStatus{ param([string]$JobId)    Invoke-GcApiRequest -Method 'GET'  -Path "/api/v2/analytics/conversations/details/jobs/$JobId" }
+function Submit-AnalyticsJob { param([string]$JsonBody) Invoke-GcApiRequest -Method 'POST' -Path '/api/v2/analytics/conversations/details/jobs' -Body $JsonBody }
+function Get-AnalyticsJobStatus { param([string]$JobId)    Invoke-GcApiRequest -Method 'GET' -Path "/api/v2/analytics/conversations/details/jobs/$JobId" }
 function Remove-AnalyticsJob {
     param([string]$JobId)
 
@@ -247,7 +248,8 @@ function Get-AllAttributeKeys {
         $attrs = $cust.attributes
         if ($attrs -is [System.Collections.IDictionary]) {
             foreach ($k in $attrs.Keys) { $keys.Add([string]$k) | Out-Null }
-        } else {
+        }
+        else {
             foreach ($p in $attrs.PSObject.Properties) { $keys.Add($p.Name) | Out-Null }
         }
     }
@@ -258,12 +260,12 @@ function Get-AllAttributeKeys {
 function ConvertTo-FlatRow {
     param([object]$Conv, [string[]]$AttrCols)
 
-    $agent  = Get-ParticipantByPurpose -Conv $Conv -Purpose 'agent'
-    $cust   = Get-ParticipantByPurpose -Conv $Conv -Purpose 'customer'
+    $agent = Get-ParticipantByPurpose -Conv $Conv -Purpose 'agent'
+    $cust = Get-ParticipantByPurpose -Conv $Conv -Purpose 'customer'
 
     $sessions = if ($null -ne $agent -and $null -ne $agent.sessions) { @($agent.sessions) } else { @() }
     $mediaType = if ($sessions.Count -gt 0) { [string]$sessions[0].mediaType } else { '' }
-    $queueId   = Get-QueueIdFromSessions -Sessions $sessions
+    $queueId = Get-QueueIdFromSessions -Sessions $sessions
 
     $startDt = $null; $endDt = $null; $durSec = ''
     try {
@@ -276,20 +278,21 @@ function ConvertTo-FlatRow {
         if ($null -ne $startDt -and $null -ne $endDt) {
             $durSec = [int]($endDt - $startDt).TotalSeconds
         }
-    } catch {}
+    }
+    catch {}
 
     # Metrics are stored in milliseconds; convert to seconds
     $msToSec = { param($v) if ($null -ne $v) { [int]($v / 1000) } else { '' } }
     $tHandle = & $msToSec (Get-MetricValue -Sessions $sessions -Name 'tHandle')
-    $tTalk   = & $msToSec (Get-MetricValue -Sessions $sessions -Name 'tTalk')
-    $tAcw    = & $msToSec (Get-MetricValue -Sessions $sessions -Name 'tAcw')
-    $tHeld   = & $msToSec (Get-MetricValue -Sessions $sessions -Name 'tHeld')
-    $nConn   = Get-MetricValue -Sessions $sessions -Name 'nConnected'
+    $tTalk = & $msToSec (Get-MetricValue -Sessions $sessions -Name 'tTalk')
+    $tAcw = & $msToSec (Get-MetricValue -Sessions $sessions -Name 'tAcw')
+    $tHeld = & $msToSec (Get-MetricValue -Sessions $sessions -Name 'tHeld')
+    $nConn = Get-MetricValue -Sessions $sessions -Name 'nConnected'
 
     $row = [ordered]@{
         ConversationId = [string]$Conv.conversationId
         Start          = if ($null -ne $startDt) { $startDt.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
-        End            = if ($null -ne $endDt)   { $endDt.ToString('yyyy-MM-dd HH:mm:ss')   } else { '' }
+        End            = if ($null -ne $endDt) { $endDt.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
         DurationSec    = [string]$durSec
         Direction      = [string]$Conv.originatingDirection
         MediaType      = $mediaType
@@ -420,8 +423,8 @@ function Read-ConversationsFromFile {
     )
 
     $conversations = [System.Collections.Generic.List[object]]::new()
-    $errors        = [System.Collections.Generic.List[string]]::new()
-    $lineNumber    = 0
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $lineNumber = 0
     $progressInterval = 500
 
     function Report-Progress {
@@ -450,7 +453,7 @@ function Read-ConversationsFromFile {
 
     # Peek at first non-whitespace character to detect format
     $firstChar = $null
-    $reader    = $null
+    $reader = $null
     try {
         $reader = [System.IO.StreamReader]::new($Path, [System.Text.Encoding]::UTF8, $true)
         while (-not $reader.EndOfStream) {
@@ -560,7 +563,7 @@ function Read-ConversationsFromFile {
       <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
 
-    <!-- -- Auth --------------------------------------------------- -->
+    <!-- Auth -->
     <GroupBox Grid.Row="0" Header="Authentication">
       <Grid>
         <Grid.ColumnDefinitions>
@@ -587,7 +590,7 @@ function Read-ConversationsFromFile {
       </Grid>
     </GroupBox>
 
-    <!-- -- Main Tabs ----------------------------------------------- -->
+    <!-- Main Tabs -->
     <TabControl Grid.Row="1" Name="MainTabControl">
 
       <!-- == Tab 1: Query Builder == -->
@@ -880,7 +883,7 @@ function Read-ConversationsFromFile {
       </TabItem>
     </TabControl>
 
-    <!-- -- Status bar -------------------------------------------- -->
+    <!-- Status bar -->
     <Border Grid.Row="2" Background="#F0F0F0" BorderBrush="#CCCCCC" BorderThickness="0,1,0,0" Padding="4,2">
       <TextBlock Name="StatusText" Text="Ready - authenticate and build a query to begin."/>
     </Border>
@@ -898,58 +901,67 @@ $window = [System.Windows.Markup.XamlReader]::Load($reader)
 
 # Named controls
 function Get-Control { param([string]$Name) $window.FindName($Name) }
+function Get-ComboValue {
+    param($ComboBox)
 
-$regionComboBox    = Get-Control 'RegionComboBox'
-$clientIdBox       = Get-Control 'ClientIdBox'
-$clientSecretBox   = Get-Control 'ClientSecretBox'
-$authButton        = Get-Control 'AuthButton'
-$authStatusLabel   = Get-Control 'AuthStatusLabel'
+    if ($null -eq $ComboBox) { return '' }
+    if ($null -ne $ComboBox.SelectedItem -and $ComboBox.SelectedItem -is [System.Windows.Controls.ComboBoxItem]) {
+        return [string]$ComboBox.SelectedItem.Content
+    }
+    return [string]$ComboBox.Text
+}
 
-$startDatePicker   = Get-Control 'StartDatePicker'
-$startTimeTextBox  = Get-Control 'StartTimeTextBox'
-$endDatePicker     = Get-Control 'EndDatePicker'
-$endTimeTextBox    = Get-Control 'EndTimeTextBox'
-$directionCombo    = Get-Control 'DirectionCombo'
-$mediaTypeCombo    = Get-Control 'MediaTypeCombo'
-$orderByCombo      = Get-Control 'OrderByCombo'
-$orderCombo        = Get-Control 'OrderCombo'
+$regionComboBox = Get-Control 'RegionComboBox'
+$clientIdBox = Get-Control 'ClientIdBox'
+$clientSecretBox = Get-Control 'ClientSecretBox'
+$authButton = Get-Control 'AuthButton'
+$authStatusLabel = Get-Control 'AuthStatusLabel'
 
-$convFilterPanel   = Get-Control 'ConvFilterPanel'
-$segFilterPanel    = Get-Control 'SegFilterPanel'
+$startDatePicker = Get-Control 'StartDatePicker'
+$startTimeTextBox = Get-Control 'StartTimeTextBox'
+$endDatePicker = Get-Control 'EndDatePicker'
+$endTimeTextBox = Get-Control 'EndTimeTextBox'
+$directionCombo = Get-Control 'DirectionCombo'
+$mediaTypeCombo = Get-Control 'MediaTypeCombo'
+$orderByCombo = Get-Control 'OrderByCombo'
+$orderCombo = Get-Control 'OrderCombo'
+
+$convFilterPanel = Get-Control 'ConvFilterPanel'
+$segFilterPanel = Get-Control 'SegFilterPanel'
 $requestEndpointBox = Get-Control 'RequestEndpointBox'
-$addConvFilterBtn  = Get-Control 'AddConvFilterBtn'
-$addSegFilterBtn   = Get-Control 'AddSegFilterBtn'
-$queryPreviewBox   = Get-Control 'QueryPreviewBox'
-$previewBtn        = Get-Control 'PreviewBtn'
-$clearFiltersBtn   = Get-Control 'ClearFiltersBtn'
-$submitJobBtn      = Get-Control 'SubmitJobBtn'
+$addConvFilterBtn = Get-Control 'AddConvFilterBtn'
+$addSegFilterBtn = Get-Control 'AddSegFilterBtn'
+$queryPreviewBox = Get-Control 'QueryPreviewBox'
+$previewBtn = Get-Control 'PreviewBtn'
+$clearFiltersBtn = Get-Control 'ClearFiltersBtn'
+$submitJobBtn = Get-Control 'SubmitJobBtn'
 
-$mainTabControl    = Get-Control 'MainTabControl'
-$jobIdBox          = Get-Control 'JobIdBox'
-$jobStateLabel     = Get-Control 'JobStateLabel'
-$jobPollLabel      = Get-Control 'JobPollLabel'
-$jobElapsedLabel   = Get-Control 'JobElapsedLabel'
-$cancelJobBtn      = Get-Control 'CancelJobBtn'
-$jobLogBox         = Get-Control 'JobLogBox'
+$mainTabControl = Get-Control 'MainTabControl'
+$jobIdBox = Get-Control 'JobIdBox'
+$jobStateLabel = Get-Control 'JobStateLabel'
+$jobPollLabel = Get-Control 'JobPollLabel'
+$jobElapsedLabel = Get-Control 'JobElapsedLabel'
+$cancelJobBtn = Get-Control 'CancelJobBtn'
+$jobLogBox = Get-Control 'JobLogBox'
 $collectStatusText = Get-Control 'CollectStatusText'
 $collectResultsBtn = Get-Control 'CollectResultsBtn'
 
-$summaryText       = Get-Control 'SummaryText'
+$summaryText = Get-Control 'SummaryText'
 $columnSelectorBtn = Get-Control 'ColumnSelectorBtn'
-$exportCsvBtn      = Get-Control 'ExportCsvBtn'
-$exportJsonlBtn    = Get-Control 'ExportJsonlBtn'
-$loadJsonlBtn      = Get-Control 'LoadJsonlBtn'
-$clearResultsBtn   = Get-Control 'ClearResultsBtn'
+$exportCsvBtn = Get-Control 'ExportCsvBtn'
+$exportJsonlBtn = Get-Control 'ExportJsonlBtn'
+$loadJsonlBtn = Get-Control 'LoadJsonlBtn'
+$clearResultsBtn = Get-Control 'ClearResultsBtn'
 $redactExportsCheckBox = Get-Control 'RedactExportsCheckBox'
-$resultsGrid       = Get-Control 'ResultsGrid'
-$overviewPanel     = Get-Control 'OverviewPanel'
-$attributesGrid    = Get-Control 'AttributesGrid'
-$participantsGrid  = Get-Control 'ParticipantsGrid'
-$segmentsGrid      = Get-Control 'SegmentsGrid'
-$rawJsonBox        = Get-Control 'RawJsonBox'
-$statusText        = Get-Control 'StatusText'
+$resultsGrid = Get-Control 'ResultsGrid'
+$overviewPanel = Get-Control 'OverviewPanel'
+$attributesGrid = Get-Control 'AttributesGrid'
+$participantsGrid = Get-Control 'ParticipantsGrid'
+$segmentsGrid = Get-Control 'SegmentsGrid'
+$rawJsonBox = Get-Control 'RawJsonBox'
+$statusText = Get-Control 'StatusText'
 
-$detailTabControl  = Get-Control 'DetailTabControl'
+$detailTabControl = Get-Control 'DetailTabControl'
 
 $script:exportRedactionMode = [bool]$redactExportsCheckBox.IsChecked
 $redactExportsCheckBox.Add_Checked({ $script:exportRedactionMode = $true })
@@ -981,7 +993,8 @@ function Write-UiApiRetryLogEntry {
     $statusText = if ($null -ne $Entry.StatusCode) { "HTTP $($Entry.StatusCode)" } else { 'no HTTP status' }
     $retryAfterText = if ($null -ne $Entry.RetryAfterSeconds) {
         " Retry-After $($Entry.RetryAfterSeconds)s was honored."
-    } else {
+    }
+    else {
         ''
     }
 
@@ -997,22 +1010,24 @@ function New-FilterRow {
     param([string]$Type, [System.Windows.Controls.StackPanel]$Panel)
 
     $dims = if ($Type -eq 'conversation') {
-        @('mediaType','originatingDirection','queueId','userId','conversationId','divisionId','flowId','isEnded','flaggedReason')
-    } else {
-        @('purpose','segmentType','queueId','userId','flowId','disconnectType','edgeId')
+        @('mediaType', 'originatingDirection', 'queueId', 'userId', 'conversationId', 'divisionId', 'flowId', 'isEnded', 'flaggedReason')
+    }
+    else {
+        @('purpose', 'segmentType', 'queueId', 'userId', 'flowId', 'disconnectType', 'edgeId')
     }
 
     $border = New-Object System.Windows.Controls.Border
-    $border.BorderBrush     = [System.Windows.Media.Brushes]::LightGray
-    $border.BorderThickness = [System.Windows.Thickness]::new(0,0,0,1)
-    $border.Margin          = [System.Windows.Thickness]::new(0,1,0,1)
+    $border.BorderBrush = [System.Windows.Media.Brushes]::LightGray
+    $border.BorderThickness = [System.Windows.Thickness]::new(0, 0, 0, 1)
+    $border.Margin = [System.Windows.Thickness]::new(0, 1, 0, 1)
 
     $grid = New-Object System.Windows.Controls.Grid
     @(70, 150, 110, 1, 28) | ForEach-Object {
         $cd = New-Object System.Windows.Controls.ColumnDefinition
         if ($_ -eq 1) {
             $cd.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
-        } else {
+        }
+        else {
             $cd.Width = [System.Windows.GridLength]::new($_)
         }
         $grid.ColumnDefinitions.Add($cd) | Out-Null
@@ -1021,7 +1036,7 @@ function New-FilterRow {
 
     $logicCb = New-Object System.Windows.Controls.ComboBox
     $logicCb.Margin = [System.Windows.Thickness]::new(1)
-    @('and','or') | ForEach-Object { $logicCb.Items.Add($_) | Out-Null }
+    @('and', 'or') | ForEach-Object { $logicCb.Items.Add($_) | Out-Null }
     $logicCb.SelectedIndex = 0
     [System.Windows.Controls.Grid]::SetColumn($logicCb, 0); $grid.Children.Add($logicCb) | Out-Null
 
@@ -1033,7 +1048,7 @@ function New-FilterRow {
 
     $opCb = New-Object System.Windows.Controls.ComboBox
     $opCb.Margin = [System.Windows.Thickness]::new(1)
-    @('matches','notMatches','lt','lte','gt','gte') | ForEach-Object { $opCb.Items.Add($_) | Out-Null }
+    @('matches', 'notMatches', 'lt', 'lte', 'gt', 'gte') | ForEach-Object { $opCb.Items.Add($_) | Out-Null }
     $opCb.SelectedIndex = 0
     [System.Windows.Controls.Grid]::SetColumn($opCb, 2); $grid.Children.Add($opCb) | Out-Null
 
@@ -1042,7 +1057,7 @@ function New-FilterRow {
     [System.Windows.Controls.Grid]::SetColumn($valTb, 3); $grid.Children.Add($valTb) | Out-Null
 
     $remBtn = New-Object System.Windows.Controls.Button
-    $remBtn.Content = 'X'; $remBtn.Margin = [System.Windows.Thickness]::new(1); $remBtn.Padding = [System.Windows.Thickness]::new(2,0,2,0)
+    $remBtn.Content = 'X'; $remBtn.Margin = [System.Windows.Thickness]::new(1); $remBtn.Padding = [System.Windows.Thickness]::new(2, 0, 2, 0)
     $remBtn.ToolTip = 'Remove filter'
     $capturedBorder = $border; $capturedPanel = $Panel
     $remBtn.Add_Click({ $capturedPanel.Children.Remove($capturedBorder) }.GetNewClosure())
@@ -1062,11 +1077,11 @@ function Collect-FilterRows {
         if ($null -eq $g) { continue }
         $items = @($g.Children)
         $rows.Add([pscustomobject]@{
-            logic     = if ($items[0].SelectedItem) { [string]$items[0].SelectedItem } else { 'and' }
-            dimension = if ($items[1].Text) { [string]$items[1].Text } else { '' }
-            operator  = if ($items[2].SelectedItem) { [string]$items[2].SelectedItem } else { 'matches' }
-            value     = [string]$items[3].Text
-        }) | Out-Null
+                logic     = if ($items[0].SelectedItem) { [string]$items[0].SelectedItem } else { 'and' }
+                dimension = if ($items[1].Text) { [string]$items[1].Text } else { '' }
+                operator  = if ($items[2].SelectedItem) { [string]$items[2].SelectedItem } else { 'matches' }
+                value     = [string]$items[3].Text
+            }) | Out-Null
     }
     return @($rows | Where-Object { -not [string]::IsNullOrWhiteSpace($_.dimension) -and -not [string]::IsNullOrWhiteSpace($_.value) })
 }
@@ -1128,30 +1143,30 @@ function Resolve-TimeOfDayValue {
 
 function Resolve-IntervalSelection {
     $startDate = Resolve-SelectedDateValue -PrimaryDate $startDatePicker.SelectedDate -FallbackDate $endDatePicker.SelectedDate
-    $endDate   = Resolve-SelectedDateValue -PrimaryDate $endDatePicker.SelectedDate   -FallbackDate $startDatePicker.SelectedDate
+    $endDate = Resolve-SelectedDateValue -PrimaryDate $endDatePicker.SelectedDate -FallbackDate $startDatePicker.SelectedDate
 
     $startTime = Resolve-TimeOfDayValue -Text ([string]$startTimeTextBox.Text) -DefaultValue ([TimeSpan]::Zero) -Label 'Start time'
-    $endTime   = Resolve-TimeOfDayValue -Text ([string]$endTimeTextBox.Text) -DefaultValue ([TimeSpan]::new(23,59,59)) -Label 'End time'
+    $endTime = Resolve-TimeOfDayValue -Text ([string]$endTimeTextBox.Text) -DefaultValue ([TimeSpan]::new(23, 59, 59)) -Label 'End time'
 
     $startLocal = $startDate.Date.Add($startTime)
-    $endLocal   = $endDate.Date.Add($endTime)
+    $endLocal = $endDate.Date.Add($endTime)
     if ($endLocal -le $startLocal) {
         throw "End date/time must be after start date/time."
     }
 
     $startUtc = [DateTime]::SpecifyKind($startLocal, [System.DateTimeKind]::Local).ToUniversalTime()
-    $endUtc   = [DateTime]::SpecifyKind($endLocal,   [System.DateTimeKind]::Local).ToUniversalTime()
+    $endUtc = [DateTime]::SpecifyKind($endLocal, [System.DateTimeKind]::Local).ToUniversalTime()
 
     return [pscustomobject]@{
-        StartDate = $startDate
-        EndDate = $endDate
-        StartTime = $startTime
-        EndTime = $endTime
+        StartDate  = $startDate
+        EndDate    = $endDate
+        StartTime  = $startTime
+        EndTime    = $endTime
         StartLocal = $startLocal
-        EndLocal = $endLocal
-        StartUtc = $startUtc
-        EndUtc = $endUtc
-        Interval = "$($startUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))/$($endUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))"
+        EndLocal   = $endLocal
+        StartUtc   = $startUtc
+        EndUtc     = $endUtc
+        Interval   = "$($startUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))/$($endUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))"
     }
 }
 
@@ -1165,9 +1180,9 @@ function Set-IntervalControlDefaults {
     if ($null -eq $Resolved) { $Resolved = Resolve-IntervalSelection }
 
     if (-not $startDatePicker.SelectedDate) { $startDatePicker.SelectedDate = $Resolved.StartDate }
-    if (-not $endDatePicker.SelectedDate)   { $endDatePicker.SelectedDate   = $Resolved.EndDate }
+    if (-not $endDatePicker.SelectedDate) { $endDatePicker.SelectedDate = $Resolved.EndDate }
     if ([string]::IsNullOrWhiteSpace([string]$startTimeTextBox.Text)) { $startTimeTextBox.Text = $Resolved.StartTime.ToString('hh\:mm\:ss') }
-    if ([string]::IsNullOrWhiteSpace([string]$endTimeTextBox.Text))   { $endTimeTextBox.Text   = $Resolved.EndTime.ToString('hh\:mm\:ss') }
+    if ([string]::IsNullOrWhiteSpace([string]$endTimeTextBox.Text)) { $endTimeTextBox.Text = $Resolved.EndTime.ToString('hh\:mm\:ss') }
 }
 
 function Test-MapContainsKey {
@@ -1212,34 +1227,42 @@ function Build-QueryBody {
     Set-IntervalControlDefaults -Resolved $intervalSelection
     $body = [ordered]@{
         interval = $intervalSelection.Interval
-        order    = [string]$orderCombo.SelectedItem
-        orderBy  = [string]$orderByCombo.SelectedItem
+        order    = Get-ComboValue $orderCombo
+        orderBy  = Get-ComboValue $orderByCombo
     }
 
     # Quick filter: direction
-    $dir = [string]$directionCombo.SelectedItem
+    $dir = Get-ComboValue $directionCombo
     if (-not [string]::IsNullOrWhiteSpace($dir) -and $dir -ne '(any)') {
         $body['conversationFilters'] = @(@{
-            type       = 'and'
-            predicates = @(@{ dimension = 'originatingDirection'; value = $dir })
-        })
+                type       = 'and'
+                predicates = @(@{ dimension = 'originatingDirection'; value = $dir })
+            })
     }
 
     # Quick filter: media type -> segment filter (purpose=agent + mediaType from session)
-    $mt = [string]$mediaTypeCombo.SelectedItem
+    $mt = Get-ComboValue $mediaTypeCombo
     if (-not [string]::IsNullOrWhiteSpace($mt) -and $mt -ne '(any)') {
-        $existing = if (Test-MapContainsKey -Map $body -Key 'segmentFilters') { [System.Collections.Generic.List[object]]$body['segmentFilters'] } else { [System.Collections.Generic.List[object]]::new() }
+        if (Test-MapContainsKey -Map $body -Key 'segmentFilters') {
+            $existing = [System.Collections.Generic.List[object]]::new([object[]]@($body['segmentFilters']))
+        } else {
+            $existing = [System.Collections.Generic.List[object]]::new()
+        }
         $existing.Add(@{
-            type       = 'and'
-            predicates = @(@{ dimension = 'mediaType'; value = $mt })
-        }) | Out-Null
+                type       = 'and'
+                predicates = @(@{ dimension = 'mediaType'; value = $mt })
+            }) | Out-Null
         $body['segmentFilters'] = @($existing)
     }
 
     # Custom conversation filters
     $convRows = Collect-FilterRows -Panel $convFilterPanel
     if ($convRows.Count -gt 0) {
-        $existingConv = if (Test-MapContainsKey -Map $body -Key 'conversationFilters') { [System.Collections.Generic.List[object]]($body['conversationFilters']) } else { [System.Collections.Generic.List[object]]::new() }
+        if (Test-MapContainsKey -Map $body -Key 'conversationFilters') {
+            $existingConv = [System.Collections.Generic.List[object]]::new([object[]]@($body['conversationFilters']))
+        } else {
+            $existingConv = [System.Collections.Generic.List[object]]::new()
+        }
         foreach ($r in $convRows) {
             $pred = [ordered]@{ dimension = $r.dimension; value = $r.value }
             if ($r.operator -ne 'matches') { $pred['operator'] = $r.operator }
@@ -1251,7 +1274,11 @@ function Build-QueryBody {
     # Custom segment filters
     $segRows = Collect-FilterRows -Panel $segFilterPanel
     if ($segRows.Count -gt 0) {
-        $existingSeg = if (Test-MapContainsKey -Map $body -Key 'segmentFilters') { [System.Collections.Generic.List[object]]($body['segmentFilters']) } else { [System.Collections.Generic.List[object]]::new() }
+        if (Test-MapContainsKey -Map $body -Key 'segmentFilters') {
+            $existingSeg = [System.Collections.Generic.List[object]]::new([object[]]@($body['segmentFilters']))
+        } else {
+            $existingSeg = [System.Collections.Generic.List[object]]::new()
+        }
         foreach ($r in $segRows) {
             $pred = [ordered]@{ dimension = $r.dimension; value = $r.value }
             if ($r.operator -ne 'matches') { $pred['operator'] = $r.operator }
@@ -1315,7 +1342,7 @@ function Show-Results {
     }
 
     $resultsGrid.Columns.Clear()
-    $columnNames = @('ConversationId','Start','End','DurationSec','Direction','MediaType','QueueId','AgentName','AgentUserId','tHandleSec','tTalkSec','tAcwSec','tHeldSec','nConnected') + @($attrCols | ForEach-Object { "A:$_" })
+    $columnNames = @('ConversationId', 'Start', 'End', 'DurationSec', 'Direction', 'MediaType', 'QueueId', 'AgentName', 'AgentUserId', 'tHandleSec', 'tTalkSec', 'tAcwSec', 'tHeldSec', 'nConnected') + @($attrCols | ForEach-Object { "A:$_" })
     foreach ($columnName in $columnNames) {
         $column = New-Object System.Windows.Controls.DataGridTextColumn
         $column.Header = $columnName
@@ -1328,13 +1355,13 @@ function Show-Results {
 
     # Single-pass summary: count direction and media type in one loop instead of
     # three separate pipeline passes plus a full ConvertTo-FlatRow per conversation.
-    $total    = $script:allConversations.Count
-    $inbound  = 0
+    $total = $script:allConversations.Count
+    $inbound = 0
     $outbound = 0
     $mediaCounts = @{}
     foreach ($conv in $script:allConversations) {
         $dir = [string]$conv.originatingDirection
-        if ($dir -eq 'inbound')  { $inbound++ }
+        if ($dir -eq 'inbound') { $inbound++ }
         elseif ($dir -eq 'outbound') { $outbound++ }
 
         $mt = ''
@@ -1349,7 +1376,8 @@ function Show-Results {
 
     $displayNotice = if ($total -gt $displayCount) {
         "  |  Grid showing first $displayCount of $total rows to keep the UI responsive. Exports still include all loaded conversations."
-    } else {
+    }
+    else {
         ''
     }
 
@@ -1373,20 +1401,20 @@ function Show-ConversationDetail {
     }
     foreach ($f in $fields.GetEnumerator()) {
         $border = New-Object System.Windows.Controls.Border
-        $border.Background     = [System.Windows.Media.Brushes]::WhiteSmoke
-        $border.BorderBrush    = [System.Windows.Media.Brushes]::LightGray
+        $border.Background = [System.Windows.Media.Brushes]::WhiteSmoke
+        $border.BorderBrush = [System.Windows.Media.Brushes]::LightGray
         $border.BorderThickness = [System.Windows.Thickness]::new(1)
-        $border.Margin         = [System.Windows.Thickness]::new(4,2,4,2)
-        $border.Padding        = [System.Windows.Thickness]::new(6,3,6,3)
-        $border.CornerRadius   = [System.Windows.CornerRadius]::new(3)
+        $border.Margin = [System.Windows.Thickness]::new(4, 2, 4, 2)
+        $border.Padding = [System.Windows.Thickness]::new(6, 3, 6, 3)
+        $border.CornerRadius = [System.Windows.CornerRadius]::new(3)
 
         $sp = New-Object System.Windows.Controls.StackPanel
         $label = New-Object System.Windows.Controls.TextBlock
-        $label.Text       = $f.Key
-        $label.FontSize   = 10
+        $label.Text = $f.Key
+        $label.FontSize = 10
         $label.Foreground = [System.Windows.Media.Brushes]::Gray
         $value = New-Object System.Windows.Controls.TextBlock
-        $value.Text       = if ($null -ne $f.Value) { [string]$f.Value } else { '-' }
+        $value.Text = if ($null -ne $f.Value) { [string]$f.Value } else { '-' }
         $value.FontWeight = [System.Windows.FontWeights]::SemiBold
         $value.TextWrapping = 'Wrap'
         $sp.Children.Add($label) | Out-Null
@@ -1396,14 +1424,15 @@ function Show-ConversationDetail {
     }
 
     # -- Attributes (customer participant)
-    $cust  = Get-ParticipantByPurpose -Conv $Conv -Purpose 'customer'
+    $cust = Get-ParticipantByPurpose -Conv $Conv -Purpose 'customer'
     $attrs = if ($null -ne $cust) { $cust.attributes } else { $null }
     $attrList = [System.Collections.Generic.List[pscustomobject]]::new()
     if ($null -ne $attrs) {
         $entries = if ($attrs -is [System.Collections.IDictionary]) {
-            $attrs.Keys | Sort-Object | ForEach-Object { [pscustomobject]@{ Key=$_; Value=[string]$attrs[$_] } }
-        } else {
-            $attrs.PSObject.Properties | Sort-Object Name | ForEach-Object { [pscustomobject]@{ Key=$_.Name; Value=[string]$_.Value } }
+            $attrs.Keys | Sort-Object | ForEach-Object { [pscustomobject]@{ Key = $_; Value = [string]$attrs[$_] } }
+        }
+        else {
+            $attrs.PSObject.Properties | Sort-Object Name | ForEach-Object { [pscustomobject]@{ Key = $_.Name; Value = [string]$_.Value } }
         }
         foreach ($e in @($entries)) { $attrList.Add($e) | Out-Null }
     }
@@ -1413,12 +1442,12 @@ function Show-ConversationDetail {
     $partList = [System.Collections.Generic.List[pscustomobject]]::new()
     foreach ($p in @($Conv.participants)) {
         $partList.Add([pscustomobject]@{
-            Purpose      = [string]$p.purpose
-            Name         = [string]$p.participantName
-            UserId       = [string]$p.userId
-            Sessions     = @($p.sessions).Count
-            ExtContactId = [string]$p.externalContactId
-        }) | Out-Null
+                Purpose      = [string]$p.purpose
+                Name         = [string]$p.participantName
+                UserId       = [string]$p.userId
+                Sessions     = @($p.sessions).Count
+                ExtContactId = [string]$p.externalContactId
+            }) | Out-Null
     }
     $participantsGrid.ItemsSource = $partList
 
@@ -1432,16 +1461,17 @@ function Show-ConversationDetail {
                     if ($seg.segmentStart -and $seg.segmentEnd) {
                         $dur = [int]([DateTime]::Parse($seg.segmentEnd) - [DateTime]::Parse($seg.segmentStart)).TotalSeconds
                     }
-                } catch {}
+                }
+                catch {}
                 $segList.Add([pscustomobject]@{
-                    Purpose    = [string]$p.purpose
-                    Type       = [string]$seg.segmentType
-                    Start      = [string]$seg.segmentStart
-                    End        = [string]$seg.segmentEnd
-                    DurSec     = [string]$dur
-                    QueueId    = [string]$seg.queueId
-                    Disconnect = [string]$seg.disconnectType
-                }) | Out-Null
+                        Purpose    = [string]$p.purpose
+                        Type       = [string]$seg.segmentType
+                        Start      = [string]$seg.segmentStart
+                        End        = [string]$seg.segmentEnd
+                        DurSec     = [string]$dur
+                        QueueId    = [string]$seg.queueId
+                        Disconnect = [string]$seg.disconnectType
+                    }) | Out-Null
             }
         }
     }
@@ -1459,77 +1489,80 @@ $script:pollTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:pollTimer.Interval = [TimeSpan]::FromSeconds(3)
 
 $script:pollTimer.Add_Tick({
-    # -- Check guardrails before making the API call --
-    $elapsed = [DateTime]::UtcNow - $script:jobSubmitTime
-    $jobElapsedLabel.Text = $elapsed.ToString('mm\:ss')
+        # -- Check guardrails before making the API call --
+        $elapsed = [DateTime]::UtcNow - $script:jobSubmitTime
+        $jobElapsedLabel.Text = $elapsed.ToString('mm\:ss')
 
-    if ($script:pollCount -ge $script:maxPollCount) {
-        $script:pollTimer.Stop()
-        $cancelJobBtn.IsEnabled = $false
-        $jobStateLabel.Text = 'STOPPED'
-        $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
-        Append-JobLog "Polling stopped: reached max poll count ($($script:maxPollCount))."
-        $collectStatusText.Text = "Polling stopped after $($script:maxPollCount) attempts. Cancel the job or try collecting manually if it completed."
-        Set-Status 'Polling stopped - max poll count reached.'
-        return
-    }
-
-    if ($elapsed.TotalMinutes -ge $script:maxPollTimeoutMinutes) {
-        $script:pollTimer.Stop()
-        $cancelJobBtn.IsEnabled = $false
-        $jobStateLabel.Text = 'TIMEOUT'
-        $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
-        Append-JobLog "Polling stopped: timeout after $($script:maxPollTimeoutMinutes) minutes."
-        $collectStatusText.Text = "Polling timed out after $($script:maxPollTimeoutMinutes) min. Cancel the job or try collecting manually if it completed."
-        Set-Status 'Polling stopped - timeout.'
-        return
-    }
-
-    try {
-        $status = Get-AnalyticsJobStatus -JobId $script:currentJobId
-        $state  = [string]$status.state
-
-        $script:pollCount++
-        $script:consecutivePollErrors = 0
-        $jobStateLabel.Text = $state
-        $jobPollLabel.Text  = [string]$script:pollCount
-
-        Append-JobLog "Poll $($script:pollCount): state=$state"
-
-        if ($state -in @('FULFILLED', 'FAILED', 'CANCELLED')) {
+        if ($script:pollCount -ge $script:maxPollCount) {
             $script:pollTimer.Stop()
             $cancelJobBtn.IsEnabled = $false
-
-            if ($state -eq 'FULFILLED') {
-                $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkGreen
-                $collectResultsBtn.IsEnabled = $true
-                $collectStatusText.Text = "Job FULFILLED! Click 'Collect All Results' to page through and load all conversations."
-                Append-JobLog "Job complete. Ready to collect results."
-                Set-Status "Job $($script:currentJobId) fulfilled - click Collect."
-            } else {
-                $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
-                $collectStatusText.Text = "Job ended in state: $state. Submit a new job."
-                Append-JobLog "Job ended with non-success state: $state"
-                Set-Status "Job $state - check log."
-            }
-        } else {
-            $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkOrange
-        }
-    } catch {
-        $script:consecutivePollErrors++
-        $failureText = Format-UiApiFailure -Exception $_.Exception
-        Append-JobLog "Poll error ($($script:consecutivePollErrors)/$($script:maxConsecutivePollErrors)): $failureText"
-
-        if ($script:consecutivePollErrors -ge $script:maxConsecutivePollErrors) {
-            $script:pollTimer.Stop()
-            $jobStateLabel.Text = 'ERROR'
+            $jobStateLabel.Text = 'STOPPED'
             $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
-            $collectResultsBtn.IsEnabled = $false
-            $collectStatusText.Text = "Polling stopped after $($script:maxConsecutivePollErrors) consecutive errors. Review the activity log."
-            Set-Status 'Polling stopped - too many consecutive errors.'
+            Append-JobLog "Polling stopped: reached max poll count ($($script:maxPollCount))."
+            $collectStatusText.Text = "Polling stopped after $($script:maxPollCount) attempts. Cancel the job or try collecting manually if it completed."
+            Set-Status 'Polling stopped - max poll count reached.'
+            return
         }
-    }
-})
+
+        if ($elapsed.TotalMinutes -ge $script:maxPollTimeoutMinutes) {
+            $script:pollTimer.Stop()
+            $cancelJobBtn.IsEnabled = $false
+            $jobStateLabel.Text = 'TIMEOUT'
+            $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
+            Append-JobLog "Polling stopped: timeout after $($script:maxPollTimeoutMinutes) minutes."
+            $collectStatusText.Text = "Polling timed out after $($script:maxPollTimeoutMinutes) min. Cancel the job or try collecting manually if it completed."
+            Set-Status 'Polling stopped - timeout.'
+            return
+        }
+
+        try {
+            $status = Get-AnalyticsJobStatus -JobId $script:currentJobId
+            $state = [string]$status.state
+
+            $script:pollCount++
+            $script:consecutivePollErrors = 0
+            $jobStateLabel.Text = $state
+            $jobPollLabel.Text = [string]$script:pollCount
+
+            Append-JobLog "Poll $($script:pollCount): state=$state"
+
+            if ($state -in @('FULFILLED', 'FAILED', 'CANCELLED')) {
+                $script:pollTimer.Stop()
+                $cancelJobBtn.IsEnabled = $false
+
+                if ($state -eq 'FULFILLED') {
+                    $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkGreen
+                    $collectResultsBtn.IsEnabled = $true
+                    $collectStatusText.Text = "Job FULFILLED! Click 'Collect All Results' to page through and load all conversations."
+                    Append-JobLog "Job complete. Ready to collect results."
+                    Set-Status "Job $($script:currentJobId) fulfilled - click Collect."
+                }
+                else {
+                    $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
+                    $collectStatusText.Text = "Job ended in state: $state. Submit a new job."
+                    Append-JobLog "Job ended with non-success state: $state"
+                    Set-Status "Job $state - check log."
+                }
+            }
+            else {
+                $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkOrange
+            }
+        }
+        catch {
+            $script:consecutivePollErrors++
+            $failureText = Format-UiApiFailure -Exception $_.Exception
+            Append-JobLog "Poll error ($($script:consecutivePollErrors)/$($script:maxConsecutivePollErrors)): $failureText"
+
+            if ($script:consecutivePollErrors -ge $script:maxConsecutivePollErrors) {
+                $script:pollTimer.Stop()
+                $jobStateLabel.Text = 'ERROR'
+                $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
+                $collectResultsBtn.IsEnabled = $false
+                $collectStatusText.Text = "Polling stopped after $($script:maxConsecutivePollErrors) consecutive errors. Review the activity log."
+                Set-Status 'Polling stopped - too many consecutive errors.'
+            }
+        }
+    })
 
 # -----------------------------------------------------------------------------
 # Event handlers
@@ -1538,56 +1571,56 @@ $script:pollTimer.Add_Tick({
 # -- Auth ----------------------------------------------------------------------
 
 $authButton.Add_Click({
-    $region = ([string]$regionComboBox.Text).Trim()
-    if ([string]::IsNullOrWhiteSpace($region)) { $region = $DefaultRegion }
+        $region = ([string]$regionComboBox.Text).Trim()
+        if ([string]::IsNullOrWhiteSpace($region)) { $region = $DefaultRegion }
 
-    if (-not (Test-RegionValue -Region $region)) {
-        [System.Windows.MessageBox]::Show(
-            "Invalid region '$region'.`nRegion must be a valid hostname such as 'usw2.pure.cloud' or 'mypurecloud.com'.",
-            'Invalid Region', 'OK', 'Warning') | Out-Null
-        return
-    }
+        if (-not (Test-RegionValue -Region $region)) {
+            [System.Windows.MessageBox]::Show(
+                "Invalid region '$region'.`nRegion must be a valid hostname such as 'usw2.pure.cloud' or 'mypurecloud.com'.",
+                'Invalid Region', 'OK', 'Warning') | Out-Null
+            return
+        }
 
-    $script:baseUri = "https://api.$region"
+        $script:baseUri = "https://api.$region"
 
-    $clientId     = [string]$clientIdBox.Text
-    $clientSecret = [string]$clientSecretBox.Password
+        $clientId = [string]$clientIdBox.Text
+        $clientSecret = [string]$clientSecretBox.Password
 
-    if ([string]::IsNullOrWhiteSpace($clientId) -or [string]::IsNullOrWhiteSpace($clientSecret)) {
-        [System.Windows.MessageBox]::Show('Enter Client ID and Secret.', 'Authentication', 'OK', 'Warning') | Out-Null
-        return
-    }
+        if ([string]::IsNullOrWhiteSpace($clientId) -or [string]::IsNullOrWhiteSpace($clientSecret)) {
+            [System.Windows.MessageBox]::Show('Enter Client ID and Secret.', 'Authentication', 'OK', 'Warning') | Out-Null
+            return
+        }
 
-    $authButton.IsEnabled = $false
-    Set-Status 'Authenticating...'
-    $authStatusLabel.Text = 'Authenticating...'
-    $authStatusLabel.Foreground = [System.Windows.Media.Brushes]::DarkOrange
+        $authButton.IsEnabled = $false
+        Set-Status 'Authenticating...'
+        $authStatusLabel.Text = 'Authenticating...'
+        $authStatusLabel.Foreground = [System.Windows.Media.Brushes]::DarkOrange
 
-    try {
-        $pair       = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("${clientId}:${clientSecret}"))
-        $authResult = Invoke-RestMethod -Uri "https://login.$region/oauth/token" -Method POST `
-            -Headers @{ Authorization = "Basic $pair" } `
-            -Body @{ grant_type = 'client_credentials' } -ErrorAction Stop
+        try {
+            $pair = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("${clientId}:${clientSecret}"))
+            $authResult = Invoke-RestMethod -Uri "https://login.$region/oauth/token" -Method POST `
+                -Headers @{ Authorization = "Basic $pair" } `
+                -Body @{ grant_type = 'client_credentials' } -ErrorAction Stop
 
-        $script:accessToken = $authResult.access_token
-        $script:headers     = @{ Authorization = "Bearer $($script:accessToken)" }
+            $script:accessToken = $authResult.access_token
+            $script:headers = @{ Authorization = "Bearer $($script:accessToken)" }
 
-        $authStatusLabel.Text       = 'Authenticated'
-        $authStatusLabel.Foreground = [System.Windows.Media.Brushes]::DarkGreen
-        Save-GenesysEnvConfig -Region $region -ClientId $clientId
-        Set-Status "Authenticated - $region."
-        Append-JobLog "Authenticated to $region."
-    }
-    catch {
-        $authStatusLabel.Text       = 'Failed'
-        $authStatusLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
-        Set-Status "Authentication failed."
-        [System.Windows.MessageBox]::Show("Authentication failed:`n$($_.Exception.Message)", 'Auth Error', 'OK', 'Error') | Out-Null
-    }
-    finally {
-        $authButton.IsEnabled = $true
-    }
-})
+            $authStatusLabel.Text = 'Authenticated'
+            $authStatusLabel.Foreground = [System.Windows.Media.Brushes]::DarkGreen
+            Save-GenesysEnvConfig -Region $region -ClientId $clientId
+            Set-Status "Authenticated - $region."
+            Append-JobLog "Authenticated to $region."
+        }
+        catch {
+            $authStatusLabel.Text = 'Failed'
+            $authStatusLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
+            Set-Status "Authentication failed."
+            [System.Windows.MessageBox]::Show("Authentication failed:`n$($_.Exception.Message)", 'Auth Error', 'OK', 'Error') | Out-Null
+        }
+        finally {
+            $authButton.IsEnabled = $true
+        }
+    })
 
 # -- Date presets --------------------------------------------------------------
 
@@ -1597,437 +1630,479 @@ function Set-DatePreset {
     # regardless of any value previously typed into the time boxes.
     param([DateTime]$Start, [DateTime]$End)
     $startDatePicker.SelectedDate = $Start
-    $endDatePicker.SelectedDate   = $End
+    $endDatePicker.SelectedDate = $End
     $startTimeTextBox.Text = '00:00:00'
-    $endTimeTextBox.Text   = '23:59:59'
+    $endTimeTextBox.Text = '23:59:59'
 }
 
 (Get-Control 'PresetToday').Add_Click({
-    $t = [DateTime]::Today; Set-DatePreset -Start $t -End $t
-})
+        $t = [DateTime]::Today; Set-DatePreset -Start $t -End $t
+    })
 (Get-Control 'PresetYesterday').Add_Click({
-    $y = [DateTime]::Today.AddDays(-1); Set-DatePreset -Start $y -End $y
-})
+        $y = [DateTime]::Today.AddDays(-1); Set-DatePreset -Start $y -End $y
+    })
 (Get-Control 'PresetLast7').Add_Click({
-    Set-DatePreset -Start ([DateTime]::Today.AddDays(-6)) -End ([DateTime]::Today)
-})
+        Set-DatePreset -Start ([DateTime]::Today.AddDays(-6)) -End ([DateTime]::Today)
+    })
 (Get-Control 'PresetLast30').Add_Click({
-    Set-DatePreset -Start ([DateTime]::Today.AddDays(-29)) -End ([DateTime]::Today)
-})
+        Set-DatePreset -Start ([DateTime]::Today.AddDays(-29)) -End ([DateTime]::Today)
+    })
 (Get-Control 'PresetThisMonth').Add_Click({
-    $now = [DateTime]::Today
-    $s = [DateTime]::new($now.Year, $now.Month, 1)
-    Set-DatePreset -Start $s -End $now
-})
+        $now = [DateTime]::Today
+        $s = [DateTime]::new($now.Year, $now.Month, 1)
+        Set-DatePreset -Start $s -End $now
+    })
 (Get-Control 'PresetLastMonth').Add_Click({
-    $now = [DateTime]::Today
-    $s = [DateTime]::new($now.Year, $now.Month, 1).AddMonths(-1)
-    $e = [DateTime]::new($now.Year, $now.Month, 1).AddDays(-1)
-    Set-DatePreset -Start $s -End $e
-})
+        $now = [DateTime]::Today
+        $s = [DateTime]::new($now.Year, $now.Month, 1).AddMonths(-1)
+        $e = [DateTime]::new($now.Year, $now.Month, 1).AddDays(-1)
+        Set-DatePreset -Start $s -End $e
+    })
 
 # -- Filter rows ---------------------------------------------------------------
 
 $addConvFilterBtn.Add_Click({ New-FilterRow -Type 'conversation' -Panel $convFilterPanel | Out-Null })
-$addSegFilterBtn.Add_Click({  New-FilterRow -Type 'segment'      -Panel $segFilterPanel  | Out-Null })
+$addSegFilterBtn.Add_Click({ New-FilterRow -Type 'segment' -Panel $segFilterPanel  | Out-Null })
 
 $clearFiltersBtn.Add_Click({
-    $convFilterPanel.Children.Clear()
-    $segFilterPanel.Children.Clear()
-    $directionCombo.SelectedIndex  = 0
-    $mediaTypeCombo.SelectedIndex  = 0
-    $requestEndpointBox.Text       = ''
-    $queryPreviewBox.Text          = ''
-})
+        $convFilterPanel.Children.Clear()
+        $segFilterPanel.Children.Clear()
+        $directionCombo.SelectedIndex = 0
+        $mediaTypeCombo.SelectedIndex = 0
+        $requestEndpointBox.Text = ''
+        $queryPreviewBox.Text = ''
+    })
 
 # -- Preview JSON --------------------------------------------------------------
 
 $previewBtn.Add_Click({
-    try {
-        $preview = Build-QueryRequestPreview
-        $requestEndpointBox.Text = $preview.EndpointUri
-        $queryPreviewBox.Text = $preview.BodyJson
-        Set-Status "Preview updated for $($preview.EndpointUri)"
-    }
-    catch {
-        $requestEndpointBox.Text = ''
-        $queryPreviewBox.Text = "Error: $($_.Exception.Message)"
-    }
-})
+        try {
+            $preview = Build-QueryRequestPreview
+            $requestEndpointBox.Text = $preview.EndpointUri
+            $queryPreviewBox.Text = $preview.BodyJson
+            Set-Status "Preview updated for $($preview.EndpointUri)"
+        }
+        catch {
+            $err = $_
+            $line = if ($err.InvocationInfo -and $err.InvocationInfo.ScriptLineNumber) {
+                $err.InvocationInfo.ScriptLineNumber
+            }
+            else {
+                'unknown'
+            }
+
+            $cmd = if ($err.InvocationInfo -and $err.InvocationInfo.Line) {
+                $err.InvocationInfo.Line.Trim()
+            }
+            else {
+                '<no line text>'
+            }
+
+            $pos = if ($err.InvocationInfo -and $err.InvocationInfo.PositionMessage) {
+                $err.InvocationInfo.PositionMessage
+            }
+            else {
+                '<no position info>'
+            }
+
+            $stack = if ($err.ScriptStackTrace) {
+                $err.ScriptStackTrace
+            }
+            else {
+                '<no script stack>'
+            }
+
+            $requestEndpointBox.Text = ''
+            $queryPreviewBox.Text = @"
+Error: $($err.Exception.Message)
+
+Line: $line
+Command: $cmd
+
+Position:
+$pos
+
+Stack:
+$stack
+"@
+
+            Set-Status "Preview failed at line $line"
+        }
+    })
 
 # -- Submit job ----------------------------------------------------------------
 
 $submitJobBtn.Add_Click({
-    if ([string]::IsNullOrWhiteSpace($script:accessToken)) {
-        [System.Windows.MessageBox]::Show('Please authenticate first.', 'Not Authenticated', 'OK', 'Warning') | Out-Null
-        return
-    }
+        if ([string]::IsNullOrWhiteSpace($script:accessToken)) {
+            [System.Windows.MessageBox]::Show('Please authenticate first.', 'Not Authenticated', 'OK', 'Warning') | Out-Null
+            return
+        }
 
-    try {
-        $preview = Build-QueryRequestPreview
-        $body    = $preview.Body
-        $jsonBody = $preview.BodyJson
+        try {
+            $preview = Build-QueryRequestPreview
+            $body = $preview.Body
+            $jsonBody = $preview.BodyJson
 
-        $requestEndpointBox.Text = $preview.EndpointUri
-        $queryPreviewBox.Text = $jsonBody
+            $requestEndpointBox.Text = $preview.EndpointUri
+            $queryPreviewBox.Text = $jsonBody
 
-        Append-JobLog "Submitting job..."
-        Append-JobLog "Endpoint: $($preview.EndpointUri)"
-        Append-JobLog "Body: $jsonBody"
-        Set-Status 'Submitting job...'
+            Append-JobLog "Submitting job..."
+            Append-JobLog "Endpoint: $($preview.EndpointUri)"
+            Append-JobLog "Body: $jsonBody"
+            Set-Status 'Submitting job...'
 
-        $result = Submit-AnalyticsJob -JsonBody $jsonBody
-        $jobId  = [string]$result.jobId
+            $result = Submit-AnalyticsJob -JsonBody $jsonBody
+            $jobId = [string]$result.jobId
 
-        if ([string]::IsNullOrWhiteSpace($jobId)) { throw "No jobId in response." }
+            if ([string]::IsNullOrWhiteSpace($jobId)) { throw "No jobId in response." }
 
-        $script:currentJobId          = $jobId
-        $script:pollCount             = 0
-        $script:consecutivePollErrors = 0
-        $script:jobSubmitTime         = [DateTime]::UtcNow
+            $script:currentJobId = $jobId
+            $script:pollCount = 0
+            $script:consecutivePollErrors = 0
+            $script:jobSubmitTime = [DateTime]::UtcNow
 
-        $jobIdBox.Text         = $jobId
-        $jobStateLabel.Text    = [string]$result.state
-        $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkOrange
-        $jobPollLabel.Text     = '0'
-        $jobElapsedLabel.Text  = '00:00'
-        $cancelJobBtn.IsEnabled   = $true
-        $collectResultsBtn.IsEnabled = $false
-        $collectStatusText.Text = 'Job submitted. Polling for completion...'
+            $jobIdBox.Text = $jobId
+            $jobStateLabel.Text = [string]$result.state
+            $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkOrange
+            $jobPollLabel.Text = '0'
+            $jobElapsedLabel.Text = '00:00'
+            $cancelJobBtn.IsEnabled = $true
+            $collectResultsBtn.IsEnabled = $false
+            $collectStatusText.Text = 'Job submitted. Polling for completion...'
 
-        Append-JobLog "Job submitted: $jobId  (initial state: $($result.state))"
-        Set-Status "Job $jobId submitted - polling..."
+            Append-JobLog "Job submitted: $jobId  (initial state: $($result.state))"
+            Set-Status "Job $jobId submitted - polling..."
 
-        # Switch to Job Monitor tab
-        $mainTabControl.SelectedIndex = 1
+            # Switch to Job Monitor tab
+            $mainTabControl.SelectedIndex = 1
 
-        $script:pollTimer.Start()
-    }
-    catch {
-        $failureText = Format-UiApiFailure -Exception $_.Exception
-        [System.Windows.MessageBox]::Show("Submit failed:`n$failureText", 'Submit Error', 'OK', 'Error') | Out-Null
-        Set-Status "Job submit failed."
-        Append-JobLog "Submit error: $failureText"
-    }
-})
+            $script:pollTimer.Start()
+        }
+        catch {
+            $failureText = Format-UiApiFailure -Exception $_.Exception
+            [System.Windows.MessageBox]::Show("Submit failed:`n$failureText", 'Submit Error', 'OK', 'Error') | Out-Null
+            Set-Status "Job submit failed."
+            Append-JobLog "Submit error: $failureText"
+        }
+    })
 
 # -- Cancel job ----------------------------------------------------------------
 
 $cancelJobBtn.Add_Click({
-    if ([string]::IsNullOrWhiteSpace($script:currentJobId)) { return }
-    $r = [System.Windows.MessageBox]::Show(
-        "Delete/cancel job $($script:currentJobId)?", 'Confirm Cancel', 'YesNo', 'Question')
-    if ($r -ne 'Yes') { return }
+        if ([string]::IsNullOrWhiteSpace($script:currentJobId)) { return }
+        $r = [System.Windows.MessageBox]::Show(
+            "Delete/cancel job $($script:currentJobId)?", 'Confirm Cancel', 'YesNo', 'Question')
+        if ($r -ne 'Yes') { return }
 
-    $script:pollTimer.Stop()
-    $deleteSucceeded = Remove-AnalyticsJob -JobId $script:currentJobId
-    $collectResultsBtn.IsEnabled = $false
-    if ($deleteSucceeded) {
-        Append-JobLog "Job $($script:currentJobId) cancelled/deleted."
-        $jobStateLabel.Text       = 'CANCELLED'
-        $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
-        $cancelJobBtn.IsEnabled   = $false
-        $collectStatusText.Text   = 'Job cancelled. Submit a new job.'
-        Set-Status 'Job cancelled.'
-    }
-    else {
-        $jobStateLabel.Text       = 'DELETE FAILED'
-        $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
-        $cancelJobBtn.IsEnabled   = $true
-        $collectStatusText.Text   = 'Delete request failed. The remote job may still exist; review the activity log.'
-        Set-Status 'Job delete failed - see log.'
-        [System.Windows.MessageBox]::Show("Delete/cancel failed. The local poller was stopped, but the remote job may still exist.`nSee the activity log for details.", 'Cancel Error', 'OK', 'Warning') | Out-Null
-    }
-})
+        $script:pollTimer.Stop()
+        $deleteSucceeded = Remove-AnalyticsJob -JobId $script:currentJobId
+        $collectResultsBtn.IsEnabled = $false
+        if ($deleteSucceeded) {
+            Append-JobLog "Job $($script:currentJobId) cancelled/deleted."
+            $jobStateLabel.Text = 'CANCELLED'
+            $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
+            $cancelJobBtn.IsEnabled = $false
+            $collectStatusText.Text = 'Job cancelled. Submit a new job.'
+            Set-Status 'Job cancelled.'
+        }
+        else {
+            $jobStateLabel.Text = 'DELETE FAILED'
+            $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
+            $cancelJobBtn.IsEnabled = $true
+            $collectStatusText.Text = 'Delete request failed. The remote job may still exist; review the activity log.'
+            Set-Status 'Job delete failed - see log.'
+            [System.Windows.MessageBox]::Show("Delete/cancel failed. The local poller was stopped, but the remote job may still exist.`nSee the activity log for details.", 'Cancel Error', 'OK', 'Warning') | Out-Null
+        }
+    })
 
 # -- Collect results -----------------------------------------------------------
 
 $collectResultsBtn.Add_Click({
-    $collectResultsBtn.IsEnabled = $false
-    Clear-ConversationStore
-    $script:seenCursors = [System.Collections.Generic.HashSet[string]]::new()
-    $cursor = $null
-    $page   = 0
+        $collectResultsBtn.IsEnabled = $false
+        Clear-ConversationStore
+        $script:seenCursors = [System.Collections.Generic.HashSet[string]]::new()
+        $cursor = $null
+        $page = 0
 
-    Append-JobLog "Collecting results from job $($script:currentJobId)..."
-    Append-JobLog "  Guardrails: max $($script:maxPageCount) pages, cursor loop detection enabled."
-    Set-Status 'Collecting results...'
+        Append-JobLog "Collecting results from job $($script:currentJobId)..."
+        Append-JobLog "  Guardrails: max $($script:maxPageCount) pages, cursor loop detection enabled."
+        Set-Status 'Collecting results...'
 
-    try {
-        do {
-            $page++
+        try {
+            do {
+                $page++
 
-            # -- Max page guard --
-            if ($page -gt $script:maxPageCount) {
-                Append-JobLog "Collection stopped: reached max page count ($($script:maxPageCount))."
-                [System.Windows.MessageBox]::Show(
-                    "Collection stopped after $($script:maxPageCount) pages ($($script:allConversations.Count) conversations collected).`nThis is a safety limit. Results collected so far are available in the Results tab.",
-                    'Page Limit Reached', 'OK', 'Warning') | Out-Null
-                break
-            }
-
-            Append-JobLog "  Page $page - cursor: $(if ($cursor) { $cursor.Substring(0, [Math]::Min(20,$cursor.Length)) + '...' } else { '(first)' })"
-
-            $result = Get-AnalyticsJobResults -JobId $script:currentJobId -PageSize 1000 -Cursor $cursor
-            $batch  = @($result.conversations)
-            Add-Conversations -Conversations $batch
-            $cursor = [string]$result.cursor
-            Append-JobLog "  Got $($batch.Count) - total so far: $($script:allConversations.Count)"
-            Set-Status "Collecting... $($script:allConversations.Count) conversations so far (page $page)."
-
-            # -- Cursor loop detection --
-            if (-not [string]::IsNullOrWhiteSpace($cursor)) {
-                if (-not $script:seenCursors.Add($cursor)) {
-                    Append-JobLog "Collection stopped: cursor loop detected (cursor repeated on page $page)."
+                # -- Max page guard --
+                if ($page -gt $script:maxPageCount) {
+                    Append-JobLog "Collection stopped: reached max page count ($($script:maxPageCount))."
                     [System.Windows.MessageBox]::Show(
-                        "Collection stopped: the API returned a cursor that was already seen, indicating a loop.`n$($script:allConversations.Count) conversations collected so far are available in the Results tab.",
-                        'Cursor Loop Detected', 'OK', 'Warning') | Out-Null
+                        "Collection stopped after $($script:maxPageCount) pages ($($script:allConversations.Count) conversations collected).`nThis is a safety limit. Results collected so far are available in the Results tab.",
+                        'Page Limit Reached', 'OK', 'Warning') | Out-Null
                     break
                 }
-            }
 
-            # Let the UI breathe between pages
-            [System.Windows.Forms.Application]::DoEvents()
-        } while (-not [string]::IsNullOrWhiteSpace($cursor))
+                Append-JobLog "  Page $page - cursor: $(if ($cursor) { $cursor.Substring(0, [Math]::Min(20,$cursor.Length)) + '...' } else { '(first)' })"
 
-        Append-JobLog "Collection complete. $($script:allConversations.Count) total conversations across $page pages."
-        Set-Status "Collection complete: $($script:allConversations.Count) conversations."
+                $result = Get-AnalyticsJobResults -JobId $script:currentJobId -PageSize 1000 -Cursor $cursor
+                $batch = @($result.conversations)
+                Add-Conversations -Conversations $batch
+                $cursor = [string]$result.cursor
+                Append-JobLog "  Got $($batch.Count) - total so far: $($script:allConversations.Count)"
+                Set-Status "Collecting... $($script:allConversations.Count) conversations so far (page $page)."
 
-        Show-Results
-        $mainTabControl.SelectedIndex = 2
-    }
-    catch {
-        $failureText = Format-UiApiFailure -Exception $_.Exception
-        Append-JobLog "Collection error on page $($page): $failureText"
-        Set-Status 'Collection error - see log.'
-        [System.Windows.MessageBox]::Show("Collection failed on page $($page):`n$failureText", 'Error', 'OK', 'Error') | Out-Null
+                # -- Cursor loop detection --
+                if (-not [string]::IsNullOrWhiteSpace($cursor)) {
+                    if (-not $script:seenCursors.Add($cursor)) {
+                        Append-JobLog "Collection stopped: cursor loop detected (cursor repeated on page $page)."
+                        [System.Windows.MessageBox]::Show(
+                            "Collection stopped: the API returned a cursor that was already seen, indicating a loop.`n$($script:allConversations.Count) conversations collected so far are available in the Results tab.",
+                            'Cursor Loop Detected', 'OK', 'Warning') | Out-Null
+                        break
+                    }
+                }
 
-        # Show partial results if any were collected before the error
-        if ($script:allConversations.Count -gt 0) {
-            Append-JobLog "Showing $($script:allConversations.Count) partial results collected before failure."
+                # Let the UI breathe between pages
+                [System.Windows.Forms.Application]::DoEvents()
+            } while (-not [string]::IsNullOrWhiteSpace($cursor))
+
+            Append-JobLog "Collection complete. $($script:allConversations.Count) total conversations across $page pages."
+            Set-Status "Collection complete: $($script:allConversations.Count) conversations."
+
             Show-Results
             $mainTabControl.SelectedIndex = 2
         }
-    }
-    finally {
-        $script:seenCursors = $null
-        $collectResultsBtn.IsEnabled = $true
-    }
-})
+        catch {
+            $failureText = Format-UiApiFailure -Exception $_.Exception
+            Append-JobLog "Collection error on page $($page): $failureText"
+            Set-Status 'Collection error - see log.'
+            [System.Windows.MessageBox]::Show("Collection failed on page $($page):`n$failureText", 'Error', 'OK', 'Error') | Out-Null
+
+            # Show partial results if any were collected before the error
+            if ($script:allConversations.Count -gt 0) {
+                Append-JobLog "Showing $($script:allConversations.Count) partial results collected before failure."
+                Show-Results
+                $mainTabControl.SelectedIndex = 2
+            }
+        }
+        finally {
+            $script:seenCursors = $null
+            $collectResultsBtn.IsEnabled = $true
+        }
+    })
 
 # -- Results grid selection ----------------------------------------------------
 
 $resultsGrid.Add_SelectionChanged({
-    $row = $resultsGrid.SelectedItem
-    if ($null -eq $row) { return }
-    $convId = [string]$row.ConversationId
-    $conv   = Get-ConversationById -ConversationId $convId
-    if ($null -eq $conv) { return }
-    Show-ConversationDetail -Conv $conv
-})
+        $row = $resultsGrid.SelectedItem
+        if ($null -eq $row) { return }
+        $convId = [string]$row.ConversationId
+        $conv = Get-ConversationById -ConversationId $convId
+        if ($null -eq $conv) { return }
+        Show-ConversationDetail -Conv $conv
+    })
 
 # -- Column selector -----------------------------------------------------------
 
 $columnSelectorBtn.Add_Click({
-    $allKeys = Get-AllAttributeKeys
-    if ($allKeys.Count -eq 0) {
-        [System.Windows.MessageBox]::Show('No attribute keys found. Load results first.', 'Column Selector', 'OK', 'Information') | Out-Null
-        return
-    }
+        $allKeys = Get-AllAttributeKeys
+        if ($allKeys.Count -eq 0) {
+            [System.Windows.MessageBox]::Show('No attribute keys found. Load results first.', 'Column Selector', 'OK', 'Information') | Out-Null
+            return
+        }
 
-    $popup = New-Object System.Windows.Window
-    $popup.Title  = 'Select Attribute Columns to Include'
-    $popup.Width  = 420; $popup.Height = 540
-    $popup.WindowStartupLocation = 'CenterOwner'; $popup.Owner = $window
-    $popup.ResizeMode = 'NoResize'
+        $popup = New-Object System.Windows.Window
+        $popup.Title = 'Select Attribute Columns to Include'
+        $popup.Width = 420; $popup.Height = 540
+        $popup.WindowStartupLocation = 'CenterOwner'; $popup.Owner = $window
+        $popup.ResizeMode = 'NoResize'
 
-    $outerGrid = New-Object System.Windows.Controls.Grid
-    $r0 = New-Object System.Windows.Controls.RowDefinition; $r0.Height = [System.Windows.GridLength]::Star
-    $r1 = New-Object System.Windows.Controls.RowDefinition; $r1.Height = [System.Windows.GridLength]::Auto
-    $outerGrid.RowDefinitions.Add($r0); $outerGrid.RowDefinitions.Add($r1)
-    $popup.Content = $outerGrid
+        $outerGrid = New-Object System.Windows.Controls.Grid
+        $r0 = New-Object System.Windows.Controls.RowDefinition; $r0.Height = [System.Windows.GridLength]::Star
+        $r1 = New-Object System.Windows.Controls.RowDefinition; $r1.Height = [System.Windows.GridLength]::Auto
+        $outerGrid.RowDefinitions.Add($r0); $outerGrid.RowDefinitions.Add($r1)
+        $popup.Content = $outerGrid
 
-    $scroll = New-Object System.Windows.Controls.ScrollViewer; $scroll.VerticalScrollBarVisibility = 'Auto'
-    $inner  = New-Object System.Windows.Controls.StackPanel; $inner.Margin = [System.Windows.Thickness]::new(10)
-    $scroll.Content = $inner
-    [System.Windows.Controls.Grid]::SetRow($scroll, 0); $outerGrid.Children.Add($scroll) | Out-Null
+        $scroll = New-Object System.Windows.Controls.ScrollViewer; $scroll.VerticalScrollBarVisibility = 'Auto'
+        $inner = New-Object System.Windows.Controls.StackPanel; $inner.Margin = [System.Windows.Thickness]::new(10)
+        $scroll.Content = $inner
+        [System.Windows.Controls.Grid]::SetRow($scroll, 0); $outerGrid.Children.Add($scroll) | Out-Null
 
-    # Search box
-    $searchBox = New-Object System.Windows.Controls.TextBox
-    $searchBox.Margin = [System.Windows.Thickness]::new(0,0,0,6)
-    $searchBox.ToolTip = 'Filter attribute list'
-    $inner.Children.Add($searchBox) | Out-Null
-
-    $cbList = [System.Collections.Generic.List[System.Windows.Controls.CheckBox]]::new()
-
-    function Render-AttrList {
-        param([string]$Filter = '')
-        $inner.Children.Clear()
+        # Search box
+        $searchBox = New-Object System.Windows.Controls.TextBox
+        $searchBox.Margin = [System.Windows.Thickness]::new(0, 0, 0, 6)
+        $searchBox.ToolTip = 'Filter attribute list'
         $inner.Children.Add($searchBox) | Out-Null
-        $cbList.Clear()
-        foreach ($k in $allKeys) {
-            if ($Filter -and $k -notlike "*$Filter*") { continue }
-            $cb = New-Object System.Windows.Controls.CheckBox
-            $cb.Content   = $k; $cb.Tag = $k
-            $cb.Margin    = [System.Windows.Thickness]::new(0,1,0,1)
-            $cb.IsChecked = $script:selectedAttrCols -contains $k
-            $inner.Children.Add($cb) | Out-Null
-            $cbList.Add($cb) | Out-Null
+
+        $cbList = [System.Collections.Generic.List[System.Windows.Controls.CheckBox]]::new()
+
+        function Render-AttrList {
+            param([string]$Filter = '')
+            $inner.Children.Clear()
+            $inner.Children.Add($searchBox) | Out-Null
+            $cbList.Clear()
+            foreach ($k in $allKeys) {
+                if ($Filter -and $k -notlike "*$Filter*") { continue }
+                $cb = New-Object System.Windows.Controls.CheckBox
+                $cb.Content = $k; $cb.Tag = $k
+                $cb.Margin = [System.Windows.Thickness]::new(0, 1, 0, 1)
+                $cb.IsChecked = $script:selectedAttrCols -contains $k
+                $inner.Children.Add($cb) | Out-Null
+                $cbList.Add($cb) | Out-Null
+            }
         }
-    }
 
-    Render-AttrList
+        Render-AttrList
 
-    $searchBox.Add_TextChanged({ Render-AttrList -Filter $searchBox.Text }.GetNewClosure())
+        $searchBox.Add_TextChanged({ Render-AttrList -Filter $searchBox.Text }.GetNewClosure())
 
-    $btnRow = New-Object System.Windows.Controls.StackPanel
-    $btnRow.Orientation = 'Horizontal'; $btnRow.HorizontalAlignment = 'Right'
-    $btnRow.Margin = [System.Windows.Thickness]::new(6)
-    [System.Windows.Controls.Grid]::SetRow($btnRow, 1); $outerGrid.Children.Add($btnRow) | Out-Null
+        $btnRow = New-Object System.Windows.Controls.StackPanel
+        $btnRow.Orientation = 'Horizontal'; $btnRow.HorizontalAlignment = 'Right'
+        $btnRow.Margin = [System.Windows.Thickness]::new(6)
+        [System.Windows.Controls.Grid]::SetRow($btnRow, 1); $outerGrid.Children.Add($btnRow) | Out-Null
 
-    $applyBtn = New-Object System.Windows.Controls.Button; $applyBtn.Content = 'Apply & Refresh'; $applyBtn.Width = 110
-    $applyBtn.Add_Click({
-        $script:selectedAttrCols.Clear()
-        foreach ($cb in @($cbList)) {
-            if ($cb.IsChecked) { $script:selectedAttrCols.Add([string]$cb.Tag) | Out-Null }
-        }
-        $popup.Close()
-        if ($script:allConversations.Count -gt 0) { Show-Results }
-    }.GetNewClosure())
-    $btnRow.Children.Add($applyBtn) | Out-Null
+        $applyBtn = New-Object System.Windows.Controls.Button; $applyBtn.Content = 'Apply & Refresh'; $applyBtn.Width = 110
+        $applyBtn.Add_Click({
+                $script:selectedAttrCols.Clear()
+                foreach ($cb in @($cbList)) {
+                    if ($cb.IsChecked) { $script:selectedAttrCols.Add([string]$cb.Tag) | Out-Null }
+                }
+                $popup.Close()
+                if ($script:allConversations.Count -gt 0) { Show-Results }
+            }.GetNewClosure())
+        $btnRow.Children.Add($applyBtn) | Out-Null
 
-    $cancelBtn = New-Object System.Windows.Controls.Button; $cancelBtn.Content = 'Cancel'; $cancelBtn.Width = 70; $cancelBtn.Margin = [System.Windows.Thickness]::new(4,0,0,0)
-    $cancelBtn.Add_Click({ $popup.Close() })
-    $btnRow.Children.Add($cancelBtn) | Out-Null
+        $cancelBtn = New-Object System.Windows.Controls.Button; $cancelBtn.Content = 'Cancel'; $cancelBtn.Width = 70; $cancelBtn.Margin = [System.Windows.Thickness]::new(4, 0, 0, 0)
+        $cancelBtn.Add_Click({ $popup.Close() })
+        $btnRow.Children.Add($cancelBtn) | Out-Null
 
-    $popup.ShowDialog() | Out-Null
-})
+        $popup.ShowDialog() | Out-Null
+    })
 
 # -- Export CSV ----------------------------------------------------------------
 
 $exportCsvBtn.Add_Click({
-    if ($script:allConversations.Count -eq 0) {
-        [System.Windows.MessageBox]::Show('No results to export.', 'Export', 'OK', 'Information') | Out-Null; return
-    }
-    $dlg = New-Object System.Windows.Forms.SaveFileDialog
-    $dlg.Filter   = 'CSV files (*.csv)|*.csv'
-    $dlg.FileName = "conversations-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
-    if ($dlg.ShowDialog() -ne 'OK') { return }
+        if ($script:allConversations.Count -eq 0) {
+            [System.Windows.MessageBox]::Show('No results to export.', 'Export', 'OK', 'Information') | Out-Null; return
+        }
+        $dlg = New-Object System.Windows.Forms.SaveFileDialog
+        $dlg.Filter = 'CSV files (*.csv)|*.csv'
+        $dlg.FileName = "conversations-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+        if ($dlg.ShowDialog() -ne 'OK') { return }
 
-    try {
-        $attrCols = @($script:selectedAttrCols)
-        $script:allConversations |
-            ForEach-Object {
-                $row = ConvertTo-FlatRow -Conv $_ -AttrCols $attrCols
-                if ($script:exportRedactionMode) {
-                    foreach ($property in @($row.PSObject.Properties)) {
-                        $property.Value = Protect-ScalarValue -Value $property.Value -Key $property.Name
+        try {
+            $attrCols = @($script:selectedAttrCols)
+            $script:allConversations |
+                ForEach-Object {
+                    $row = ConvertTo-FlatRow -Conv $_ -AttrCols $attrCols
+                    if ($script:exportRedactionMode) {
+                        foreach ($property in @($row.PSObject.Properties)) {
+                            $property.Value = Protect-ScalarValue -Value $property.Value -Key $property.Name
+                        }
                     }
-                }
-                $row
-            } |
-            Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding UTF8
-        Set-Status "Exported $($script:allConversations.Count) rows to $($dlg.FileName)"
-        [System.Windows.MessageBox]::Show("Exported $($script:allConversations.Count) conversations to:`n$($dlg.FileName)", 'Export Complete', 'OK', 'Information') | Out-Null
-    }
-    catch {
-        [System.Windows.MessageBox]::Show("Export failed:`n$($_.Exception.Message)", 'Export Error', 'OK', 'Error') | Out-Null
-    }
-})
+                    $row
+                } |
+                Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding UTF8
+            Set-Status "Exported $($script:allConversations.Count) rows to $($dlg.FileName)"
+            [System.Windows.MessageBox]::Show("Exported $($script:allConversations.Count) conversations to:`n$($dlg.FileName)", 'Export Complete', 'OK', 'Information') | Out-Null
+        }
+        catch {
+            [System.Windows.MessageBox]::Show("Export failed:`n$($_.Exception.Message)", 'Export Error', 'OK', 'Error') | Out-Null
+        }
+    })
 
 # -- Export JSONL --------------------------------------------------------------
 
 $exportJsonlBtn.Add_Click({
-    if ($script:allConversations.Count -eq 0) {
-        [System.Windows.MessageBox]::Show('No results to export.', 'Export', 'OK', 'Information') | Out-Null; return
-    }
-    $dlg = New-Object System.Windows.Forms.SaveFileDialog
-    $dlg.Filter   = 'JSONL files (*.jsonl)|*.jsonl|JSON files (*.json)|*.json'
-    $dlg.FileName = "conversations-$(Get-Date -Format 'yyyyMMdd-HHmmss').jsonl"
-    if ($dlg.ShowDialog() -ne 'OK') { return }
-
-    $writer = $null
-    try {
-        $writer = [System.IO.StreamWriter]::new($dlg.FileName, $false, [System.Text.Encoding]::UTF8)
-        foreach ($conv in @($script:allConversations)) {
-            $writer.WriteLine(((Get-ExportConversation -Conversation $conv) | ConvertTo-Json -Depth 20 -Compress))
+        if ($script:allConversations.Count -eq 0) {
+            [System.Windows.MessageBox]::Show('No results to export.', 'Export', 'OK', 'Information') | Out-Null; return
         }
-        Set-Status "Exported $($script:allConversations.Count) conversations (JSONL) to $($dlg.FileName)"
-        [System.Windows.MessageBox]::Show("Exported $($script:allConversations.Count) conversations to:`n$($dlg.FileName)", 'Export Complete', 'OK', 'Information') | Out-Null
-    }
-    catch {
-        [System.Windows.MessageBox]::Show("Export failed:`n$($_.Exception.Message)", 'Export Error', 'OK', 'Error') | Out-Null
-    }
-    finally {
-        if ($null -ne $writer) { $writer.Dispose() }
-    }
-})
+        $dlg = New-Object System.Windows.Forms.SaveFileDialog
+        $dlg.Filter = 'JSONL files (*.jsonl)|*.jsonl|JSON files (*.json)|*.json'
+        $dlg.FileName = "conversations-$(Get-Date -Format 'yyyyMMdd-HHmmss').jsonl"
+        if ($dlg.ShowDialog() -ne 'OK') { return }
+
+        $writer = $null
+        try {
+            $writer = [System.IO.StreamWriter]::new($dlg.FileName, $false, [System.Text.Encoding]::UTF8)
+            foreach ($conv in @($script:allConversations)) {
+                $writer.WriteLine(((Get-ExportConversation -Conversation $conv) | ConvertTo-Json -Depth 20 -Compress))
+            }
+            Set-Status "Exported $($script:allConversations.Count) conversations (JSONL) to $($dlg.FileName)"
+            [System.Windows.MessageBox]::Show("Exported $($script:allConversations.Count) conversations to:`n$($dlg.FileName)", 'Export Complete', 'OK', 'Information') | Out-Null
+        }
+        catch {
+            [System.Windows.MessageBox]::Show("Export failed:`n$($_.Exception.Message)", 'Export Error', 'OK', 'Error') | Out-Null
+        }
+        finally {
+            if ($null -ne $writer) { $writer.Dispose() }
+        }
+    })
 
 # -- Load from JSONL -----------------------------------------------------------
 
 $loadJsonlBtn.Add_Click({
-    $dlg = New-Object System.Windows.Forms.OpenFileDialog
-    $dlg.Filter = 'JSONL files (*.jsonl)|*.jsonl|JSON files (*.json)|*.json|All files (*.*)|*.*'
-    $dlg.Title  = 'Load Conversation JSONL'
-    if ($dlg.ShowDialog() -ne 'OK') { return }
+        $dlg = New-Object System.Windows.Forms.OpenFileDialog
+        $dlg.Filter = 'JSONL files (*.jsonl)|*.jsonl|JSON files (*.json)|*.json|All files (*.*)|*.*'
+        $dlg.Title = 'Load Conversation JSONL'
+        if ($dlg.ShowDialog() -ne 'OK') { return }
 
-    try {
-        Clear-ConversationStore
-        Set-Status "Loading $($dlg.FileName)..."
+        try {
+            Clear-ConversationStore
+            Set-Status "Loading $($dlg.FileName)..."
 
-        $progressAction = {
-            param([hashtable]$Info)
-            Set-Status "Loading... $($Info.Count) conversations read (line $($Info.LineNumber))."
-            [System.Windows.Forms.Application]::DoEvents()
-        }.GetNewClosure()
+            $progressAction = {
+                param([hashtable]$Info)
+                Set-Status "Loading... $($Info.Count) conversations read (line $($Info.LineNumber))."
+                [System.Windows.Forms.Application]::DoEvents()
+            }.GetNewClosure()
 
-        $loadResult = Read-ConversationsFromFile -Path $dlg.FileName -OnProgress $progressAction
-        Add-Conversations -Conversations $loadResult.Conversations
+            $loadResult = Read-ConversationsFromFile -Path $dlg.FileName -OnProgress $progressAction
+            Add-Conversations -Conversations $loadResult.Conversations
 
-        # Report any per-line parse errors
-        if ($loadResult.ErrorCount -gt 0) {
-            $preview = ($loadResult.Errors | Select-Object -First 5) -join "`n"
-            $moreNote = if ($loadResult.ErrorCount -gt 5) { "`n... and $($loadResult.ErrorCount - 5) more." } else { '' }
-            [System.Windows.MessageBox]::Show(
-                "$($loadResult.ErrorCount) lines could not be parsed and were skipped:`n`n$preview$moreNote",
-                'Partial Load Warnings', 'OK', 'Warning') | Out-Null
+            # Report any per-line parse errors
+            if ($loadResult.ErrorCount -gt 0) {
+                $preview = ($loadResult.Errors | Select-Object -First 5) -join "`n"
+                $moreNote = if ($loadResult.ErrorCount -gt 5) { "`n... and $($loadResult.ErrorCount - 5) more." } else { '' }
+                [System.Windows.MessageBox]::Show(
+                    "$($loadResult.ErrorCount) lines could not be parsed and were skipped:`n`n$preview$moreNote",
+                    'Partial Load Warnings', 'OK', 'Warning') | Out-Null
+            }
+
+            Show-Results
+            $mainTabControl.SelectedIndex = 2
+
+            $errorSuffix = if ($loadResult.ErrorCount -gt 0) { " ($($loadResult.ErrorCount) lines skipped)" } else { '' }
+            Set-Status "Loaded $($script:allConversations.Count) conversations from file.$errorSuffix"
         }
-
-        Show-Results
-        $mainTabControl.SelectedIndex = 2
-
-        $errorSuffix = if ($loadResult.ErrorCount -gt 0) { " ($($loadResult.ErrorCount) lines skipped)" } else { '' }
-        Set-Status "Loaded $($script:allConversations.Count) conversations from file.$errorSuffix"
-    }
-    catch {
-        [System.Windows.MessageBox]::Show("Load failed:`n$($_.Exception.Message)", 'Load Error', 'OK', 'Error') | Out-Null
-        Set-Status 'Load failed.'
-    }
-})
+        catch {
+            [System.Windows.MessageBox]::Show("Load failed:`n$($_.Exception.Message)", 'Load Error', 'OK', 'Error') | Out-Null
+            Set-Status 'Load failed.'
+        }
+    })
 
 # -- Clear results -------------------------------------------------------------
 
 $clearResultsBtn.Add_Click({
-    Clear-ConversationStore
-    $resultsGrid.ItemsSource = $null
-    $resultsGrid.Columns.Clear()
-    $summaryText.Text = 'Results cleared.'
-    $overviewPanel.Children.Clear()
-    $attributesGrid.ItemsSource   = $null
-    $participantsGrid.ItemsSource = $null
-    $segmentsGrid.ItemsSource     = $null
-    $rawJsonBox.Text = ''
-    Set-Status 'Results cleared.'
-})
+        Clear-ConversationStore
+        $resultsGrid.ItemsSource = $null
+        $resultsGrid.Columns.Clear()
+        $summaryText.Text = 'Results cleared.'
+        $overviewPanel.Children.Clear()
+        $attributesGrid.ItemsSource = $null
+        $participantsGrid.ItemsSource = $null
+        $segmentsGrid.ItemsSource = $null
+        $rawJsonBox.Text = ''
+        Set-Status 'Results cleared.'
+    })
 
 # -----------------------------------------------------------------------------
 # Startup: load persisted config + auto-auth
 # -----------------------------------------------------------------------------
 
 $startDatePicker.SelectedDate = [DateTime]::Today
-$endDatePicker.SelectedDate   = [DateTime]::Today
-$startTimeTextBox.Text        = '00:00:00'
-$endTimeTextBox.Text          = '23:59:59'
+$endDatePicker.SelectedDate = [DateTime]::Today
+$startTimeTextBox.Text = '00:00:00'
+$endTimeTextBox.Text = '23:59:59'
 Set-IntervalControlDefaults
 
 $cfg = Read-GenesysEnvConfig
@@ -2035,12 +2110,12 @@ if ($null -ne $cfg) {
     $cfgRegion = Get-ConfigString -ConfigObject $cfg -PropertyNames @('region')
     if (-not [string]::IsNullOrWhiteSpace($cfgRegion)) { $regionComboBox.Text = $cfgRegion }
 
-    $cfgClientId = Get-ConfigString -ConfigObject $cfg -PropertyNames @('clientId','client_id')
+    $cfgClientId = Get-ConfigString -ConfigObject $cfg -PropertyNames @('clientId', 'client_id')
     if (-not [string]::IsNullOrWhiteSpace($cfgClientId)) { $clientIdBox.Text = $cfgClientId }
 }
 
 # Env vars override config
-if (-not [string]::IsNullOrWhiteSpace($env:GENESYS_CLIENT_ID))     { $clientIdBox.Text       = $env:GENESYS_CLIENT_ID }
+if (-not [string]::IsNullOrWhiteSpace($env:GENESYS_CLIENT_ID)) { $clientIdBox.Text = $env:GENESYS_CLIENT_ID }
 if (-not [string]::IsNullOrWhiteSpace($env:GENESYS_CLIENT_SECRET)) { $clientSecretBox.Password = $env:GENESYS_CLIENT_SECRET }
 
 if (-not [string]::IsNullOrWhiteSpace([string]$clientIdBox.Text) -and -not [string]::IsNullOrWhiteSpace([string]$clientSecretBox.Password)) {
