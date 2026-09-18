@@ -53,6 +53,22 @@
     request failure. Cancel/delete failures are logged as warnings instead of being
     ignored.
 
+    Analysis and reporting
+    ----------------------
+    src/analysis/ConversationAnalysis.ps1 builds one cached profile per conversation
+    (queue path, agent path, wrap-up, disconnect, flow, ~30 metrics, MOS, evaluations,
+    surveys) and derives from it:
+      - Results grid / CSV: ~90 standard columns (Column Selector picks what the grid
+        shows; CSV always exports all of them plus selected attribute columns).
+      - Detail panel: overview, per-session participants, chronological segment
+        timeline, raw metrics, flows, and all participant attributes.
+      - Report tab: KPIs, rule-based observations, and breakdowns by queue, agent,
+        hour, date, media/direction, wrap-up, disconnect, IVR flow, voice quality,
+        division, plus longest / lowest-MOS outliers. Export Report writes a
+        self-contained HTML file and a JSON copy of the same numbers.
+    After collection (when authenticated) queue, wrap-up code, division, skill, and
+    language IDs are resolved to names; failures fall back to IDs and are logged.
+
 .NOTES
     Requirements : Windows, PowerShell 5.1+, Genesys Cloud OAuth client credentials
     Reuses       : Auth + config patterns from GenesysCore-GUI.ps1
@@ -80,6 +96,7 @@ Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 
 . (Join-Path $PSScriptRoot 'src/ui/UiApiRetry.ps1')
+. (Join-Path $PSScriptRoot 'src/analysis/ConversationAnalysis.ps1')
 
 # -----------------------------------------------------------------------------
 # Config / Auth  (shared pattern with GenesysCore-GUI.ps1)
@@ -144,8 +161,22 @@ $script:jobSubmitTime = $null
 $script:allConversations = [System.Collections.Generic.List[object]]::new()
 $script:conversationIndex = @{}
 $script:selectedAttrCols = [System.Collections.Generic.List[string]]::new()
+$script:visibleStdCols = [System.Collections.Generic.List[string]]::new([string[]]@(Get-DefaultGridColumnNames))
 $script:maxGridRows = 20000  # Display cap to keep the WPF grid responsive on large jobs
 $script:exportRedactionMode = $true  # Safe-by-default export behavior
+
+# -- Analysis caches (see src/analysis/ConversationAnalysis.ps1) ---------------
+$script:profileCache = @{}           # conversationId -> profile (IDs only; valid across lookup refreshes)
+$script:gridRowCache = $null         # flat rows for the grid, rebuilt when attributes or names change
+$script:gridRowCacheKey = ''
+$script:currentReport = $null        # collection report, rebuilt when data or names change
+$script:lookups = New-ConversationLookupTable   # id -> name for queues, wrap-up codes, divisions, skills, languages
+$script:lookupsLoaded = $false
+$script:lookupVersion = 0            # bumped on every lookup refresh to invalidate cached rows
+$script:maxLookupPages = 100         # 100 pages x 100 entities per reference type
+$script:dataSource = ''              # shown in the report header ("Analytics job <id>" or "File <name>")
+$script:dataQueryInterval = ''
+$script:currentJobInterval = ''
 
 # -- Polling and paging guardrails ---------------------------------------------
 $script:maxPollCount = 600    # Stop polling after this many attempts (~30 min at 3s interval)
@@ -208,117 +239,34 @@ function Get-AnalyticsJobResults {
 # Data transformation
 # -----------------------------------------------------------------------------
 
-function Get-ParticipantByPurpose {
-    param([object]$Conv, [string]$Purpose)
-    return @($Conv.participants | Where-Object { $_.purpose -eq $Purpose }) | Select-Object -First 1
+# Field extraction, flat rows, and the collection report live in
+# src/analysis/ConversationAnalysis.ps1. These wrappers add caching on top.
+
+function Get-CachedConversationProfile {
+    param([object]$Conv)
+    $conversationId = [string]$Conv.conversationId
+    if (-not [string]::IsNullOrWhiteSpace($conversationId) -and $script:profileCache.ContainsKey($conversationId)) {
+        return $script:profileCache[$conversationId]
+    }
+    $conversationProfile = Get-ConversationProfile -Conversation $Conv
+    if (-not [string]::IsNullOrWhiteSpace($conversationId)) { $script:profileCache[$conversationId] = $conversationProfile }
+    return $conversationProfile
 }
 
-function Get-MetricValue {
-    param([object[]]$Sessions, [string]$Name)
-    foreach ($s in @($Sessions)) {
-        $m = @($s.metrics | Where-Object { $_.name -eq $Name }) | Select-Object -First 1
-        if ($null -ne $m) { return $m.value }
-    }
-    return $null
-}
-
-function Get-QueueIdFromSessions {
-    param([object[]]$Sessions)
-    foreach ($s in @($Sessions)) {
-        $seg = @($s.segments | Where-Object { $_.segmentType -eq 'interact' -and $null -ne $_.queueId }) | Select-Object -First 1
-        if ($null -ne $seg) { return [string]$seg.queueId }
-    }
-    return ''
-}
-
-function Get-AttrValue {
-    param([object]$Attrs, [string]$Key)
-    if ($null -eq $Attrs) { return '' }
-    if ($Attrs -is [System.Collections.IDictionary]) {
-        return if ($Attrs.Contains($Key)) { [string]$Attrs[$Key] } else { '' }
-    }
-    return if ($Attrs.PSObject.Properties.Name -contains $Key) { [string]$Attrs.$Key } else { '' }
-}
-
-function Get-AllAttributeKeys {
-    $keys = [System.Collections.Generic.HashSet[string]]::new()
-    foreach ($conv in @($script:allConversations)) {
-        $cust = Get-ParticipantByPurpose -Conv $conv -Purpose 'customer'
-        if ($null -eq $cust -or $null -eq $cust.attributes) { continue }
-        $attrs = $cust.attributes
-        if ($attrs -is [System.Collections.IDictionary]) {
-            foreach ($k in $attrs.Keys) { $keys.Add([string]$k) | Out-Null }
-        }
-        else {
-            foreach ($p in $attrs.PSObject.Properties) { $keys.Add($p.Name) | Out-Null }
-        }
-    }
-    return @($keys | Sort-Object)
-}
-
-
-function ConvertTo-FlatRow {
-    param([object]$Conv, [string[]]$AttrCols)
-
-    $agent = Get-ParticipantByPurpose -Conv $Conv -Purpose 'agent'
-    $cust = Get-ParticipantByPurpose -Conv $Conv -Purpose 'customer'
-
-    $sessions = if ($null -ne $agent -and $null -ne $agent.sessions) { @($agent.sessions) } else { @() }
-    $mediaType = if ($sessions.Count -gt 0) { [string]$sessions[0].mediaType } else { '' }
-    $queueId = Get-QueueIdFromSessions -Sessions $sessions
-
-    $startDt = $null; $endDt = $null; $durSec = ''
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($Conv.conversationStart)) {
-            $startDt = [DateTime]::Parse($Conv.conversationStart).ToLocalTime()
-        }
-        if (-not [string]::IsNullOrWhiteSpace($Conv.conversationEnd)) {
-            $endDt = [DateTime]::Parse($Conv.conversationEnd).ToLocalTime()
-        }
-        if ($null -ne $startDt -and $null -ne $endDt) {
-            $durSec = [int]($endDt - $startDt).TotalSeconds
-        }
-    }
-    catch {}
-
-    # Metrics are stored in milliseconds; convert to seconds
-    $msToSec = { param($v) if ($null -ne $v) { [int]($v / 1000) } else { '' } }
-    $tHandle = & $msToSec (Get-MetricValue -Sessions $sessions -Name 'tHandle')
-    $tTalk = & $msToSec (Get-MetricValue -Sessions $sessions -Name 'tTalk')
-    $tAcw = & $msToSec (Get-MetricValue -Sessions $sessions -Name 'tAcw')
-    $tHeld = & $msToSec (Get-MetricValue -Sessions $sessions -Name 'tHeld')
-    $nConn = Get-MetricValue -Sessions $sessions -Name 'nConnected'
-
-    $row = [ordered]@{
-        ConversationId = [string]$Conv.conversationId
-        Start          = if ($null -ne $startDt) { $startDt.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
-        End            = if ($null -ne $endDt) { $endDt.ToString('yyyy-MM-dd HH:mm:ss') } else { '' }
-        DurationSec    = [string]$durSec
-        Direction      = [string]$Conv.originatingDirection
-        MediaType      = $mediaType
-        QueueId        = $queueId
-        AgentName      = if ($null -ne $agent) { [string]$agent.participantName } else { '' }
-        AgentUserId    = if ($null -ne $agent) { [string]$agent.userId }          else { '' }
-        tHandleSec     = [string]$tHandle
-        tTalkSec       = [string]$tTalk
-        tAcwSec        = [string]$tAcw
-        tHeldSec       = [string]$tHeld
-        nConnected     = if ($null -ne $nConn) { [string]$nConn } else { '' }
-    }
-
-    $attrs = if ($null -ne $cust) { $cust.attributes } else { $null }
-    foreach ($col in @($AttrCols)) {
-        $row["A:$col"] = Get-AttrValue -Attrs $attrs -Key $col
-    }
-
-    return [pscustomobject]$row
+function Reset-AnalysisCaches {
+    # Profiles hold IDs only, so a lookup refresh keeps them; rows and report embed names.
+    param([switch]$IncludeProfiles)
+    if ($IncludeProfiles) { $script:profileCache = @{} }
+    $script:gridRowCache = $null
+    $script:gridRowCacheKey = ''
+    $script:currentReport = $null
 }
 
 function Clear-ConversationStore {
     $script:allConversations.Clear()
     $script:conversationIndex = @{}
+    Reset-AnalysisCaches -IncludeProfiles
 }
-
 function Add-ConversationRecord {
     param([object]$Conversation)
     if ($null -eq $Conversation) { return }
@@ -348,7 +296,8 @@ function Get-ConversationById {
 function Test-SensitiveKey {
     param([string]$Key)
     if ([string]::IsNullOrWhiteSpace($Key)) { return $false }
-    return $Key -match '(?i)(password|secret|token|ani|dnis|phone|email|address|ssn|externalContactId|participantName|firstName|lastName|fullName|displayName)'
+    # (?<!voic)email keeps Voicemail / tVoicemailSec readable.
+    return $Key -match '(?i)(password|secret|token|ani|dnis|phone|(?<!voic)email|address|ssn|externalContactId|participantName|firstName|lastName|fullName|displayName|customerName|wrapUpNote|remote|callbackNumbers|callbackUserName)'
 }
 
 function Protect-ScalarValue {
@@ -800,8 +749,9 @@ function Read-ConversationsFromFile {
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="220"/>
+            <RowDefinition Height="*" MinHeight="120"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="280" MinHeight="120"/>
           </Grid.RowDefinitions>
 
           <!-- Summary -->
@@ -812,8 +762,12 @@ function Read-ConversationsFromFile {
 
           <!-- Toolbar -->
           <WrapPanel Grid.Row="1" Margin="0,0,0,4">
-            <Button Name="ColumnSelectorBtn" Content="Column Selector..."/>
-            <Button Name="ExportCsvBtn"      Content="Export CSV"/>
+            <Button Name="ColumnSelectorBtn" Content="Column Selector..."
+                    ToolTip="Choose which of the ~90 standard columns the grid shows, and add participant attribute columns."/>
+            <Button Name="ResolveNamesBtn"   Content="Resolve Names"
+                    ToolTip="Look up queue, wrap-up code, division, skill, and language names (needs authentication)."/>
+            <Button Name="ExportCsvBtn"      Content="Export CSV"
+                    ToolTip="All standard columns plus selected attribute columns, for every loaded conversation."/>
             <Button Name="ExportJsonlBtn"    Content="Export JSONL (full)"/>
             <Button Name="LoadJsonlBtn"      Content="Load from JSONL..."/>
             <Button Name="ClearResultsBtn"   Content="Clear Results"/>
@@ -828,48 +782,36 @@ function Read-ConversationsFromFile {
                     EnableRowVirtualization="True" VirtualizingStackPanel.IsVirtualizing="True"
                     VirtualizingStackPanel.VirtualizationMode="Recycling"/>
 
-          <!-- Detail panel -->
-          <GroupBox Grid.Row="3" Header="Conversation Detail  (select a row above)">
+          <GridSplitter Grid.Row="3" Height="6" HorizontalAlignment="Stretch" ResizeDirection="Rows"
+                        Background="#E0E0E0" ToolTip="Drag to resize the detail panel"/>
+
+          <!-- Detail panel (grids get their columns from the row objects at runtime) -->
+          <GroupBox Grid.Row="4" Header="Conversation Detail  (select a row above)">
             <TabControl Name="DetailTabControl">
               <TabItem Header="Overview">
                 <ScrollViewer HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
                   <WrapPanel Name="OverviewPanel" Margin="4" Orientation="Horizontal"/>
                 </ScrollViewer>
               </TabItem>
-              <TabItem Header="Call Attributes">
-                <DataGrid Name="AttributesGrid" IsReadOnly="True" AutoGenerateColumns="False"
-                          GridLinesVisibility="Horizontal" AlternatingRowBackground="#FAFAFA">
-                  <DataGrid.Columns>
-                    <DataGridTextColumn Header="Attribute Key" Binding="{Binding Key}"   Width="220" FontFamily="Consolas"/>
-                    <DataGridTextColumn Header="Value"         Binding="{Binding Value}" Width="*"/>
-                  </DataGrid.Columns>
-                </DataGrid>
-              </TabItem>
-              <TabItem Header="Participants">
+              <TabItem Header="Participants / Sessions">
                 <DataGrid Name="ParticipantsGrid" IsReadOnly="True" AutoGenerateColumns="False"
-                          GridLinesVisibility="Horizontal">
-                  <DataGrid.Columns>
-                    <DataGridTextColumn Header="Purpose"   Binding="{Binding Purpose}"  Width="90"/>
-                    <DataGridTextColumn Header="Name"      Binding="{Binding Name}"     Width="160"/>
-                    <DataGridTextColumn Header="User ID"   Binding="{Binding UserId}"   Width="280" FontFamily="Consolas" FontSize="11"/>
-                    <DataGridTextColumn Header="Sessions"  Binding="{Binding Sessions}" Width="70"/>
-                    <DataGridTextColumn Header="Ext Contact" Binding="{Binding ExtContactId}" Width="*" FontFamily="Consolas" FontSize="11"/>
-                  </DataGrid.Columns>
-                </DataGrid>
+                          GridLinesVisibility="Horizontal" AlternatingRowBackground="#FAFAFA"/>
               </TabItem>
               <TabItem Header="Segment Timeline">
                 <DataGrid Name="SegmentsGrid" IsReadOnly="True" AutoGenerateColumns="False"
-                          GridLinesVisibility="Horizontal" AlternatingRowBackground="#FAFAFA">
-                  <DataGrid.Columns>
-                    <DataGridTextColumn Header="Purpose"    Binding="{Binding Purpose}"    Width="80"/>
-                    <DataGridTextColumn Header="Type"       Binding="{Binding Type}"       Width="90"/>
-                    <DataGridTextColumn Header="Start"      Binding="{Binding Start}"      Width="160"/>
-                    <DataGridTextColumn Header="End"        Binding="{Binding End}"        Width="160"/>
-                    <DataGridTextColumn Header="Dur (s)"    Binding="{Binding DurSec}"     Width="60"/>
-                    <DataGridTextColumn Header="Queue ID"   Binding="{Binding QueueId}"    Width="280" FontFamily="Consolas" FontSize="11"/>
-                    <DataGridTextColumn Header="Disconnect" Binding="{Binding Disconnect}" Width="*"/>
-                  </DataGrid.Columns>
-                </DataGrid>
+                          GridLinesVisibility="Horizontal" AlternatingRowBackground="#FAFAFA"/>
+              </TabItem>
+              <TabItem Header="Metrics">
+                <DataGrid Name="MetricsGrid" IsReadOnly="True" AutoGenerateColumns="False"
+                          GridLinesVisibility="Horizontal" AlternatingRowBackground="#FAFAFA"/>
+              </TabItem>
+              <TabItem Header="Flows">
+                <DataGrid Name="FlowsGrid" IsReadOnly="True" AutoGenerateColumns="False"
+                          GridLinesVisibility="Horizontal" AlternatingRowBackground="#FAFAFA"/>
+              </TabItem>
+              <TabItem Header="Attributes">
+                <DataGrid Name="AttributesGrid" IsReadOnly="True" AutoGenerateColumns="False"
+                          GridLinesVisibility="Horizontal" AlternatingRowBackground="#FAFAFA"/>
               </TabItem>
               <TabItem Header="Raw JSON">
                 <TextBox Name="RawJsonBox" IsReadOnly="True" TextWrapping="NoWrap"
@@ -879,6 +821,42 @@ function Read-ConversationsFromFile {
             </TabControl>
           </GroupBox>
 
+        </Grid>
+      </TabItem>
+
+      <!-- == Tab 4: Report == -->
+      <TabItem Header=" Report " Name="ReportTab">
+        <Grid Margin="6">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*" MinHeight="160"/>
+          </Grid.RowDefinitions>
+
+          <DockPanel Grid.Row="0" LastChildFill="True">
+            <WrapPanel DockPanel.Dock="Right" VerticalAlignment="Top">
+              <Button Name="RefreshReportBtn" Content="Refresh Report"
+                      ToolTip="Rebuild the report from the loaded conversations."/>
+              <Button Name="ExportReportBtn" Content="Export Report (HTML)" FontWeight="Bold"
+                      ToolTip="Save a self-contained HTML report plus a .json copy of the same numbers."/>
+            </WrapPanel>
+            <StackPanel>
+              <TextBlock Name="ReportHeadlineText" FontSize="13" FontWeight="Bold" TextWrapping="Wrap"
+                         Text="No report yet. Collect results or load a JSONL file."/>
+              <TextBlock Name="ReportScopeText" Foreground="Gray" TextWrapping="Wrap" Margin="0,2,0,0"/>
+            </StackPanel>
+          </DockPanel>
+
+          <ScrollViewer Grid.Row="1" MaxHeight="260" VerticalScrollBarVisibility="Auto" Margin="0,6,0,0">
+            <StackPanel Name="ReportKpiPanel"/>
+          </ScrollViewer>
+
+          <Border Grid.Row="2" Background="#FFF8E1" BorderBrush="#E0B000" BorderThickness="1" Padding="8,4" Margin="0,6,0,0">
+            <TextBlock Name="ReportObservationsText" TextWrapping="Wrap" Text="Observations appear here once a report is built."/>
+          </Border>
+
+          <TabControl Grid.Row="3" Name="ReportTablesTab" Margin="0,6,0,0"/>
         </Grid>
       </TabItem>
     </TabControl>
@@ -948,6 +926,7 @@ $collectResultsBtn = Get-Control 'CollectResultsBtn'
 
 $summaryText = Get-Control 'SummaryText'
 $columnSelectorBtn = Get-Control 'ColumnSelectorBtn'
+$resolveNamesBtn = Get-Control 'ResolveNamesBtn'
 $exportCsvBtn = Get-Control 'ExportCsvBtn'
 $exportJsonlBtn = Get-Control 'ExportJsonlBtn'
 $loadJsonlBtn = Get-Control 'LoadJsonlBtn'
@@ -958,7 +937,17 @@ $overviewPanel = Get-Control 'OverviewPanel'
 $attributesGrid = Get-Control 'AttributesGrid'
 $participantsGrid = Get-Control 'ParticipantsGrid'
 $segmentsGrid = Get-Control 'SegmentsGrid'
+$metricsGrid = Get-Control 'MetricsGrid'
+$flowsGrid = Get-Control 'FlowsGrid'
 $rawJsonBox = Get-Control 'RawJsonBox'
+
+$refreshReportBtn = Get-Control 'RefreshReportBtn'
+$exportReportBtn = Get-Control 'ExportReportBtn'
+$reportHeadlineText = Get-Control 'ReportHeadlineText'
+$reportScopeText = Get-Control 'ReportScopeText'
+$reportKpiPanel = Get-Control 'ReportKpiPanel'
+$reportObservationsText = Get-Control 'ReportObservationsText'
+$reportTablesTab = Get-Control 'ReportTablesTab'
 $statusText = Get-Control 'StatusText'
 
 $detailTabControl = Get-Control 'DetailTabControl'
@@ -1317,13 +1306,117 @@ function Build-QueryRequestPreview {
 # Results grid population
 # -----------------------------------------------------------------------------
 
+function Set-GridRows {
+    # Binds rows to a DataGrid, generating one text column per property. Column headers
+    # get tooltips from the column dictionary when the name is a known report column.
+    param(
+        [System.Windows.Controls.DataGrid]$Grid,
+        [AllowNull()][object[]]$Rows,
+        [string[]]$Columns,
+        [hashtable]$HeaderMap
+    )
+    $Grid.ItemsSource = $null
+    $Grid.Columns.Clear()
+    if ($null -eq $Rows -or $Rows.Count -eq 0) { return }
+    $list = $Rows
+    $names = if ($Columns) { $Columns } else { @($list[0].PSObject.Properties.Name) }
+    foreach ($name in $names) {
+        $header = New-Object System.Windows.Controls.TextBlock
+        $header.Text = if ($null -ne $HeaderMap -and $HeaderMap.ContainsKey($name)) { [string]$HeaderMap[$name] } else { $name }
+        $tip = Get-ColumnDescription -Name $name
+        if ($tip) { $header.ToolTip = $tip }
+        $column = New-Object System.Windows.Controls.DataGridTextColumn
+        $column.Header = $header
+        $column.SortMemberPath = $name
+        $column.Binding = New-Object System.Windows.Data.Binding($name)
+        if ($name -like '*Id' -and $name -ne 'ConversationId') { $column.FontFamily = New-Object System.Windows.Media.FontFamily('Consolas') }
+        $Grid.Columns.Add($column) | Out-Null
+    }
+    $Grid.ItemsSource = $list
+}
+
+function New-InfoTile {
+    param([string]$Label, [string]$Value, [string]$Caption, [string]$ToolTip, [double]$MinWidth = 0)
+    $border = New-Object System.Windows.Controls.Border
+    $border.Background = [System.Windows.Media.Brushes]::WhiteSmoke
+    $border.BorderBrush = [System.Windows.Media.Brushes]::LightGray
+    $border.BorderThickness = [System.Windows.Thickness]::new(1)
+    $border.Margin = [System.Windows.Thickness]::new(4, 2, 4, 2)
+    $border.Padding = [System.Windows.Thickness]::new(6, 3, 6, 3)
+    $border.CornerRadius = [System.Windows.CornerRadius]::new(3)
+    if ($MinWidth -gt 0) { $border.MinWidth = $MinWidth }
+    $border.MaxWidth = 420
+    if ($ToolTip) { $border.ToolTip = $ToolTip }
+
+    $stack = New-Object System.Windows.Controls.StackPanel
+    $labelBlock = New-Object System.Windows.Controls.TextBlock
+    $labelBlock.Text = $Label
+    $labelBlock.FontSize = 10
+    $labelBlock.Foreground = [System.Windows.Media.Brushes]::Gray
+    $valueBlock = New-Object System.Windows.Controls.TextBlock
+    $valueBlock.Text = if ([string]::IsNullOrEmpty($Value)) { '-' } else { $Value }
+    $valueBlock.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $valueBlock.TextWrapping = 'Wrap'
+    $stack.Children.Add($labelBlock) | Out-Null
+    $stack.Children.Add($valueBlock) | Out-Null
+    if ($Caption) {
+        $captionBlock = New-Object System.Windows.Controls.TextBlock
+        $captionBlock.Text = $Caption
+        $captionBlock.FontSize = 10
+        $captionBlock.Foreground = [System.Windows.Media.Brushes]::Gray
+        $captionBlock.TextWrapping = 'Wrap'
+        $stack.Children.Add($captionBlock) | Out-Null
+    }
+    $border.Child = $stack
+    return $border
+}
+
+function Update-ConversationProfiles {
+    # Builds (or reuses) the cached profile for every loaded conversation, with progress.
+    $snapshot = $script:allConversations.ToArray()
+    $total = $snapshot.Length
+    $profiles = [System.Collections.Generic.List[object]]::new($total)
+    $i = 0
+    foreach ($conv in $snapshot) {
+        $profiles.Add((Get-CachedConversationProfile -Conv $conv)) | Out-Null
+        $i++
+        if ($i % 500 -eq 0) {
+            Set-Status "Analyzing conversations... $i of $total"
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    }
+    return $profiles
+}
+
+function Get-GridRows {
+    # Flat rows for the grid, cached until attribute columns or resolved names change.
+    $attrCols = @($script:selectedAttrCols)
+    $cacheKey = '{0}|{1}|{2}' -f $script:lookupVersion, $script:allConversations.Count, ($attrCols -join [char]31)
+    if ($null -ne $script:gridRowCache -and $script:gridRowCacheKey -eq $cacheKey) { return $script:gridRowCache }
+
+    $snapshot = $script:allConversations.ToArray()
+    $limit = [Math]::Min($snapshot.Length, $script:maxGridRows)
+    $rows = [System.Collections.Generic.List[object]]::new($limit)
+    for ($i = 0; $i -lt $limit; $i++) {
+        $conv = $snapshot[$i]
+        $rows.Add((ConvertTo-FlatRow -ConversationProfile (Get-CachedConversationProfile -Conv $conv) -Conversation $conv -AttrCols $attrCols -Lookups $script:lookups -ForGrid)) | Out-Null
+        if (($i + 1) % 500 -eq 0) {
+            Set-Status "Building grid rows... $($i + 1) of $limit"
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    }
+    $script:gridRowCache = $rows
+    $script:gridRowCacheKey = $cacheKey
+    return $rows
+}
+
 function Show-Results {
     $total = $script:allConversations.Count
 
     # Warn before rendering if the dataset is large enough to cause visible UI lag
-    if ($total -gt 10000) {
+    if ($total -gt 10000 -and $null -eq $script:gridRowCache) {
         $answer = [System.Windows.MessageBox]::Show(
-            "This dataset contains $total conversations. Rendering the grid may take a moment and the UI will be unresponsive during that time.`n`nContinue?",
+            "This dataset contains $total conversations. Analyzing and rendering may take a minute and the UI will be unresponsive during that time.`n`nContinue?",
             'Large Dataset', 'YesNo', 'Warning')
         if ($answer -ne 'Yes') {
             Set-Status "Render cancelled. $total conversations remain in memory - exports are still available."
@@ -1331,154 +1424,235 @@ function Show-Results {
         }
     }
 
+    $profiles = Update-ConversationProfiles
+    $rows = Get-GridRows
     $attrCols = @($script:selectedAttrCols)
-    $displayRows = New-Object System.Collections.Generic.List[object]
-    $displayCount = 0
 
-    foreach ($conv in @($script:allConversations)) {
-        if ($displayCount -ge $script:maxGridRows) { break }
-        $displayRows.Add((ConvertTo-FlatRow -Conv $conv -AttrCols $attrCols)) | Out-Null
-        $displayCount++
-    }
+    # Visible standard columns in dictionary order, then attribute columns (bound as Attr0..N)
+    $allStandard = Get-FlatRowColumnNames
+    $columns = [System.Collections.Generic.List[string]]::new()
+    $headers = @{}
+    foreach ($name in $allStandard) { if ($script:visibleStdCols -contains $name) { $columns.Add($name) | Out-Null } }
+    for ($i = 0; $i -lt $attrCols.Count; $i++) { $columns.Add("Attr$i") | Out-Null; $headers["Attr$i"] = "A:$($attrCols[$i])" }
+    Set-GridRows -Grid $resultsGrid -Rows $rows -Columns @($columns) -HeaderMap $headers
 
-    $resultsGrid.Columns.Clear()
-    $columnNames = @('ConversationId', 'Start', 'End', 'DurationSec', 'Direction', 'MediaType', 'QueueId', 'AgentName', 'AgentUserId', 'tHandleSec', 'tTalkSec', 'tAcwSec', 'tHeldSec', 'nConnected') + @($attrCols | ForEach-Object { "A:$_" })
-    foreach ($columnName in $columnNames) {
-        $column = New-Object System.Windows.Controls.DataGridTextColumn
-        $column.Header = $columnName
-        $column.Binding = New-Object System.Windows.Data.Binding($columnName)
-        if ($columnName -eq 'ConversationId') { $column.Width = 300 }
-        $resultsGrid.Columns.Add($column) | Out-Null
-    }
-
-    $resultsGrid.ItemsSource = @($displayRows)
-
-    # Single-pass summary: count direction and media type in one loop instead of
-    # three separate pipeline passes plus a full ConvertTo-FlatRow per conversation.
-    $total = $script:allConversations.Count
-    $inbound = 0
-    $outbound = 0
+    # Summary line from the cached profiles (single pass, no per-row pipelines)
+    $inbound = 0; $outbound = 0; $offered = 0; $answered = 0; $abandoned = 0; $handleMs = 0.0; $handled = 0
     $mediaCounts = @{}
-    foreach ($conv in $script:allConversations) {
-        $dir = [string]$conv.originatingDirection
-        if ($dir -eq 'inbound') { $inbound++ }
-        elseif ($dir -eq 'outbound') { $outbound++ }
-
-        $mt = ''
-        $agent = $conv.participants | Where-Object { $_.purpose -eq 'agent' } | Select-Object -First 1
-        if ($null -ne $agent -and $null -ne $agent.sessions -and @($agent.sessions).Count -gt 0) {
-            $mt = [string]$agent.sessions[0].mediaType
-        }
-        if ([string]::IsNullOrWhiteSpace($mt)) { $mt = '(blank)' }
+    foreach ($cp in $profiles) {
+        if ($cp.Direction -eq 'inbound') { $inbound++ } elseif ($cp.Direction -eq 'outbound') { $outbound++ }
+        if ($cp.Offered) { $offered++ }
+        if ($cp.Answered) { $answered++ }
+        if ($cp.Abandoned) { $abandoned++ }
+        $value = $cp.MetricSums['tHandle']
+        if ($null -ne $value) { $handleMs += $value; $handled++ }
+        $mt = if ([string]::IsNullOrWhiteSpace($cp.MediaType)) { '(blank)' } else { $cp.MediaType }
         if ($mediaCounts.ContainsKey($mt)) { $mediaCounts[$mt]++ } else { $mediaCounts[$mt] = 1 }
     }
     $byMedia = @($mediaCounts.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { "$($_.Key): $($_.Value)" })
-
-    $displayNotice = if ($total -gt $displayCount) {
-        "  |  Grid showing first $displayCount of $total rows to keep the UI responsive. Exports still include all loaded conversations."
+    $abandonText = if ($offered -gt 0) { '  Abandoned: {0} ({1:0.0}%)' -f $abandoned, (100.0 * $abandoned / $offered) } else { '' }
+    $ahtText = if ($handled -gt 0) { '  |  AHT: {0}' -f (Format-SecondsDisplay ([Math]::Round($handleMs / $handled / 1000.0, 1))) } else { '' }
+    $namesNote = if ($script:lookupsLoaded) { '' } else { '  |  Names not resolved (IDs shown) - click Resolve Names.' }
+    $displayNotice = if ($total -gt $rows.Count) {
+        "  |  Grid showing first $($rows.Count) of $total rows. Report and exports include all loaded conversations."
     }
-    else {
-        ''
-    }
+    else { '' }
 
-    $summaryText.Text = "Loaded $total conversations  |  Inbound: $inbound  Outbound: $outbound  |  $($byMedia -join '  |  ')$displayNotice"
+    $summaryText.Text = "Loaded $total conversations  |  Inbound: $inbound  Outbound: $outbound  |  Offered: $offered  Answered: $answered$abandonText$ahtText  |  $($byMedia -join '  |  ')$displayNotice$namesNote"
+
+    Update-ReportView -Profiles $profiles
     Set-Status "Results loaded: $total conversations."
 }
 
 function Show-ConversationDetail {
     param([object]$Conv)
 
-    # -- Overview
+    $conversationProfile = Get-CachedConversationProfile -Conv $Conv
+
+    # -- Overview tiles
     $overviewPanel.Children.Clear()
-    $fields = [ordered]@{
-        'Conversation ID' = $Conv.conversationId
-        'Start (UTC)'     = $Conv.conversationStart
-        'End (UTC)'       = $Conv.conversationEnd
-        'Direction'       = $Conv.originatingDirection
-        'Division IDs'    = ($Conv.divisionIds -join ', ')
-        'MOS (min)'       = $Conv.mediaStatsMinConversationMos
-        'R-Factor (min)'  = $Conv.mediaStatsMinConversationRFactor
-    }
-    foreach ($f in $fields.GetEnumerator()) {
-        $border = New-Object System.Windows.Controls.Border
-        $border.Background = [System.Windows.Media.Brushes]::WhiteSmoke
-        $border.BorderBrush = [System.Windows.Media.Brushes]::LightGray
-        $border.BorderThickness = [System.Windows.Thickness]::new(1)
-        $border.Margin = [System.Windows.Thickness]::new(4, 2, 4, 2)
-        $border.Padding = [System.Windows.Thickness]::new(6, 3, 6, 3)
-        $border.CornerRadius = [System.Windows.CornerRadius]::new(3)
-
-        $sp = New-Object System.Windows.Controls.StackPanel
-        $label = New-Object System.Windows.Controls.TextBlock
-        $label.Text = $f.Key
-        $label.FontSize = 10
-        $label.Foreground = [System.Windows.Media.Brushes]::Gray
-        $value = New-Object System.Windows.Controls.TextBlock
-        $value.Text = if ($null -ne $f.Value) { [string]$f.Value } else { '-' }
-        $value.FontWeight = [System.Windows.FontWeights]::SemiBold
-        $value.TextWrapping = 'Wrap'
-        $sp.Children.Add($label) | Out-Null
-        $sp.Children.Add($value) | Out-Null
-        $border.Child = $sp
-        $overviewPanel.Children.Add($border) | Out-Null
+    $fields = Get-ConversationOverviewFields -ConversationProfile $conversationProfile -Lookups $script:lookups
+    foreach ($field in $fields.GetEnumerator()) {
+        $overviewPanel.Children.Add((New-InfoTile -Label $field.Key -Value ([string]$field.Value) -MinWidth 120)) | Out-Null
     }
 
-    # -- Attributes (customer participant)
-    $cust = Get-ParticipantByPurpose -Conv $Conv -Purpose 'customer'
-    $attrs = if ($null -ne $cust) { $cust.attributes } else { $null }
-    $attrList = [System.Collections.Generic.List[pscustomobject]]::new()
-    if ($null -ne $attrs) {
-        $entries = if ($attrs -is [System.Collections.IDictionary]) {
-            $attrs.Keys | Sort-Object | ForEach-Object { [pscustomobject]@{ Key = $_; Value = [string]$attrs[$_] } }
-        }
-        else {
-            $attrs.PSObject.Properties | Sort-Object Name | ForEach-Object { [pscustomobject]@{ Key = $_.Name; Value = [string]$_.Value } }
-        }
-        foreach ($e in @($entries)) { $attrList.Add($e) | Out-Null }
-    }
-    $attributesGrid.ItemsSource = $attrList
-
-    # -- Participants
-    $partList = [System.Collections.Generic.List[pscustomobject]]::new()
-    foreach ($p in @($Conv.participants)) {
-        $partList.Add([pscustomobject]@{
-                Purpose      = [string]$p.purpose
-                Name         = [string]$p.participantName
-                UserId       = [string]$p.userId
-                Sessions     = @($p.sessions).Count
-                ExtContactId = [string]$p.externalContactId
-            }) | Out-Null
-    }
-    $participantsGrid.ItemsSource = $partList
-
-    # -- Segment timeline
-    $segList = [System.Collections.Generic.List[pscustomobject]]::new()
-    foreach ($p in @($Conv.participants)) {
-        foreach ($s in @($p.sessions)) {
-            foreach ($seg in @($s.segments)) {
-                $dur = ''
-                try {
-                    if ($seg.segmentStart -and $seg.segmentEnd) {
-                        $dur = [int]([DateTime]::Parse($seg.segmentEnd) - [DateTime]::Parse($seg.segmentStart)).TotalSeconds
-                    }
-                }
-                catch {}
-                $segList.Add([pscustomobject]@{
-                        Purpose    = [string]$p.purpose
-                        Type       = [string]$seg.segmentType
-                        Start      = [string]$seg.segmentStart
-                        End        = [string]$seg.segmentEnd
-                        DurSec     = [string]$dur
-                        QueueId    = [string]$seg.queueId
-                        Disconnect = [string]$seg.disconnectType
-                    }) | Out-Null
-            }
-        }
-    }
-    $segmentsGrid.ItemsSource = $segList
+    Set-GridRows -Grid $participantsGrid -Rows (Get-ConversationSessionRows -Conversation $Conv -Lookups $script:lookups)
+    Set-GridRows -Grid $segmentsGrid -Rows (Get-ConversationSegmentRows -Conversation $Conv -Lookups $script:lookups)
+    Set-GridRows -Grid $metricsGrid -Rows (Get-ConversationMetricRows -Conversation $Conv)
+    Set-GridRows -Grid $flowsGrid -Rows (Get-ConversationFlowRows -Conversation $Conv)
+    Set-GridRows -Grid $attributesGrid -Rows (Get-ConversationAttributeRows -Conversation $Conv)
 
     # -- Raw JSON
     $rawJsonBox.Text = $Conv | ConvertTo-Json -Depth 20
+}
+
+function Clear-ReportView {
+    $reportHeadlineText.Text = 'No report yet. Collect results or load a JSONL file.'
+    $reportScopeText.Text = ''
+    $reportKpiPanel.Children.Clear()
+    $reportObservationsText.Text = 'Observations appear here once a report is built.'
+    $reportTablesTab.Items.Clear()
+}
+
+function Update-ReportView {
+    param([object[]]$Profiles, [switch]$Force)
+
+    if ($script:allConversations.Count -eq 0) { Clear-ReportView; return }
+    if ($null -eq $script:currentReport -or $Force) {
+        if ($null -eq $Profiles) { $Profiles = @(Update-ConversationProfiles) }
+        Set-Status 'Building report...'
+        [System.Windows.Forms.Application]::DoEvents()
+        $script:currentReport = Get-ConversationReport -Profiles $Profiles -Lookups $script:lookups -Source $script:dataSource -QueryInterval $script:dataQueryInterval
+    }
+    $report = $script:currentReport
+
+    $reportHeadlineText.Text = $report.Headline
+    $scope = [System.Collections.Generic.List[string]]::new()
+    $scope.Add("Data window: $($report.WindowStartLocal) to $($report.WindowEndLocal) ($($report.TimeZone))") | Out-Null
+    if ($report.QueryInterval) { $scope.Add("Query interval (UTC): $($report.QueryInterval)") | Out-Null }
+    if ($report.Source) { $scope.Add("Source: $($report.Source)") | Out-Null }
+    $scope.Add("Generated: $($report.GeneratedLocal)") | Out-Null
+    $scope.Add($report.Units) | Out-Null
+    $reportScopeText.Text = $scope -join '   |   '
+
+    # KPI tiles, one wrap row per section
+    $reportKpiPanel.Children.Clear()
+    foreach ($section in @($report.Kpis | ForEach-Object Section | Select-Object -Unique)) {
+        $heading = New-Object System.Windows.Controls.TextBlock
+        $heading.Text = $section.ToUpperInvariant()
+        $heading.FontSize = 10
+        $heading.FontWeight = [System.Windows.FontWeights]::Bold
+        $heading.Foreground = [System.Windows.Media.Brushes]::SteelBlue
+        $heading.Margin = [System.Windows.Thickness]::new(4, 4, 0, 0)
+        $reportKpiPanel.Children.Add($heading) | Out-Null
+        $wrap = New-Object System.Windows.Controls.WrapPanel
+        foreach ($kpi in @($report.Kpis | Where-Object { $_.Section -eq $section })) {
+            $wrap.Children.Add((New-InfoTile -Label $kpi.Metric -Value $kpi.Display -Caption $kpi.Detail -MinWidth 150)) | Out-Null
+        }
+        $reportKpiPanel.Children.Add($wrap) | Out-Null
+    }
+
+    $observations = @($report.Observations)
+    $reportObservationsText.Text = if ($observations.Count -gt 0) {
+        'Observations (reference thresholds - compare against your own targets):' + [Environment]::NewLine + (($observations | ForEach-Object { "  - $_" }) -join [Environment]::NewLine)
+    }
+    else { 'Observations: no reference thresholds were exceeded.' }
+
+    # One tab per breakdown table
+    $selectedHeader = if ($null -ne $reportTablesTab.SelectedItem) { [string]$reportTablesTab.SelectedItem.Header } else { '' }
+    $reportTablesTab.Items.Clear()
+    foreach ($title in $report.Tables.Keys) {
+        $table = $report.Tables[$title]
+        $dock = New-Object System.Windows.Controls.DockPanel
+        $description = New-Object System.Windows.Controls.TextBlock
+        $description.Text = $table.Description
+        $description.Foreground = [System.Windows.Media.Brushes]::Gray
+        $description.TextWrapping = 'Wrap'
+        $description.Margin = [System.Windows.Thickness]::new(2, 2, 2, 4)
+        [System.Windows.Controls.DockPanel]::SetDock($description, 'Top')
+        $dock.Children.Add($description) | Out-Null
+
+        $grid = New-Object System.Windows.Controls.DataGrid
+        $grid.IsReadOnly = $true
+        $grid.AutoGenerateColumns = $false
+        $grid.CanUserSortColumns = $true
+        $grid.GridLinesVisibility = 'Horizontal'
+        $grid.AlternatingRowBackground = New-Object System.Windows.Media.SolidColorBrush([System.Windows.Media.Color]::FromRgb(0xF9, 0xF9, 0xF9))
+        $headers = @{}
+        $rows = @($table.Rows)
+        if ($rows.Count -gt 0) {
+            foreach ($name in $rows[0].PSObject.Properties.Name) { $headers[$name] = ConvertTo-ReportHeaderText $name }
+        }
+        Set-GridRows -Grid $grid -Rows $rows -HeaderMap $headers
+        $dock.Children.Add($grid) | Out-Null
+
+        $tab = New-Object System.Windows.Controls.TabItem
+        $tab.Header = "$title ($($rows.Count))"
+        $tab.Content = $dock
+        $reportTablesTab.Items.Add($tab) | Out-Null
+        if ($selectedHeader -and $selectedHeader.StartsWith("$title (")) { $reportTablesTab.SelectedItem = $tab }
+    }
+    if ($null -eq $reportTablesTab.SelectedItem -and $reportTablesTab.Items.Count -gt 0) { $reportTablesTab.SelectedIndex = 0 }
+}
+
+function Export-ReportFile {
+    if ($script:allConversations.Count -eq 0) {
+        [System.Windows.MessageBox]::Show('No results to report on.', 'Export Report', 'OK', 'Information') | Out-Null
+        return
+    }
+    if ($null -eq $script:currentReport) { Update-ReportView }
+
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Filter = 'HTML report (*.html)|*.html'
+    $dlg.FileName = "conversation-report-$(Get-Date -Format 'yyyyMMdd-HHmmss').html"
+    if ($dlg.ShowDialog() -ne 'OK') { return }
+
+    try {
+        $htmlPath = $dlg.FileName
+        $jsonPath = [System.IO.Path]::ChangeExtension($htmlPath, '.json')
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($htmlPath, (ConvertTo-ConversationReportHtml -Report $script:currentReport), $utf8)
+        [System.IO.File]::WriteAllText($jsonPath, (ConvertTo-ConversationReportJson -Report $script:currentReport), $utf8)
+        Set-Status "Report exported to $htmlPath"
+        $open = [System.Windows.MessageBox]::Show("Report saved:`n$htmlPath`n$jsonPath`n`nOpen the HTML report now?", 'Export Complete', 'YesNo', 'Information')
+        if ($open -eq 'Yes') { Start-Process $htmlPath }
+    }
+    catch {
+        [System.Windows.MessageBox]::Show("Report export failed:`n$($_.Exception.Message)", 'Export Error', 'OK', 'Error') | Out-Null
+    }
+}
+
+function Update-ReferenceLookups {
+    # Loads id -> name maps for the reference data that analytics records only carry as IDs.
+    # Each type fails independently (e.g. missing permission) and falls back to raw IDs.
+    param([switch]$Force)
+
+    if ([string]::IsNullOrWhiteSpace($script:accessToken)) {
+        Append-JobLog 'Name lookup skipped: not authenticated. IDs are shown instead of names.'
+        return $false
+    }
+    if ($script:lookupsLoaded -and -not $Force) { return $true }
+
+    $sources = @(
+        @{ Kind = 'queues'; Label = 'queues'; Path = '/api/v2/routing/queues' }
+        @{ Kind = 'wrapupCodes'; Label = 'wrap-up codes'; Path = '/api/v2/routing/wrapupcodes' }
+        @{ Kind = 'divisions'; Label = 'divisions'; Path = '/api/v2/authorization/divisions' }
+        @{ Kind = 'skills'; Label = 'skills'; Path = '/api/v2/routing/skills' }
+        @{ Kind = 'languages'; Label = 'languages'; Path = '/api/v2/routing/languages' }
+    )
+    $loadedAny = $false
+    foreach ($source in $sources) {
+        $map = @{}
+        try {
+            $pageNumber = 1
+            $hasMore = $true
+            while ($hasMore -and $pageNumber -le $script:maxLookupPages) {
+                Set-Status "Resolving names: $($source.Label) (page $pageNumber)..."
+                [System.Windows.Forms.Application]::DoEvents()
+                $response = Invoke-GcApiRequest -Method 'GET' -Path $source.Path -QueryParams @{ pageSize = '100'; pageNumber = [string]$pageNumber }
+                $entities = @($response.entities)
+                foreach ($entity in $entities) {
+                    if ($null -ne $entity -and -not [string]::IsNullOrWhiteSpace([string]$entity.id)) { $map[[string]$entity.id] = [string]$entity.name }
+                }
+                $hasMore = if ($null -ne $response.pageCount) { $pageNumber -lt [int]$response.pageCount } else { $entities.Count -ge 100 }
+                $pageNumber++
+            }
+            $script:lookups[$source.Kind] = $map
+            $loadedAny = $true
+            Append-JobLog "Name lookup: loaded $($map.Count) $($source.Label)."
+        }
+        catch {
+            $failureText = Format-UiApiFailure -Exception $_.Exception
+            Append-JobLog "Name lookup for $($source.Label) failed; IDs will be shown instead. $failureText"
+        }
+    }
+
+    # Marked loaded even on partial failure so every collect does not retry; Resolve Names forces a retry.
+    $script:lookupsLoaded = $true
+    $script:lookupVersion++
+    Reset-AnalysisCaches
+    Set-Status 'Name lookup complete.'
+    return $loadedAny
 }
 
 # -----------------------------------------------------------------------------
@@ -1604,6 +1778,12 @@ $authButton.Add_Click({
 
             $script:accessToken = $authResult.access_token
             $script:headers = @{ Authorization = "Bearer $($script:accessToken)" }
+
+            # A new token may belong to a different org or region: drop cached names.
+            $script:lookups = New-ConversationLookupTable
+            $script:lookupsLoaded = $false
+            $script:lookupVersion++
+            Reset-AnalysisCaches
 
             $authStatusLabel.Text = 'Authenticated'
             $authStatusLabel.Foreground = [System.Windows.Media.Brushes]::DarkGreen
@@ -1757,6 +1937,7 @@ $submitJobBtn.Add_Click({
             if ([string]::IsNullOrWhiteSpace($jobId)) { throw "No jobId in response." }
 
             $script:currentJobId = $jobId
+            $script:currentJobInterval = [string]$body['interval']
             $script:pollCount = 0
             $script:consecutivePollErrors = 0
             $script:jobSubmitTime = [DateTime]::UtcNow
@@ -1868,6 +2049,9 @@ $collectResultsBtn.Add_Click({
             Append-JobLog "Collection complete. $($script:allConversations.Count) total conversations across $page pages."
             Set-Status "Collection complete: $($script:allConversations.Count) conversations."
 
+            $script:dataSource = "Analytics job $($script:currentJobId)"
+            $script:dataQueryInterval = $script:currentJobInterval
+            if (-not $script:lookupsLoaded) { Update-ReferenceLookups | Out-Null }
             Show-Results
             $mainTabControl.SelectedIndex = 2
         }
@@ -1880,6 +2064,8 @@ $collectResultsBtn.Add_Click({
             # Show partial results if any were collected before the error
             if ($script:allConversations.Count -gt 0) {
                 Append-JobLog "Showing $($script:allConversations.Count) partial results collected before failure."
+                $script:dataSource = "Analytics job $($script:currentJobId) (partial: failed on page $page)"
+                $script:dataQueryInterval = $script:currentJobInterval
                 Show-Results
                 $mainTabControl.SelectedIndex = 2
             }
@@ -1904,71 +2090,124 @@ $resultsGrid.Add_SelectionChanged({
 # -- Column selector -----------------------------------------------------------
 
 $columnSelectorBtn.Add_Click({
-        $allKeys = Get-AllAttributeKeys
-        if ($allKeys.Count -eq 0) {
-            [System.Windows.MessageBox]::Show('No attribute keys found. Load results first.', 'Column Selector', 'OK', 'Information') | Out-Null
-            return
-        }
+        # Plain scriptblock handlers (no GetNewClosure): while ShowDialog blocks, WPF events run
+        # as child scopes of this handler, so they see its locals and the real $script: scope.
+        $standardColumns = @(Get-FlatRowColumnNames)
+        $attributeKeys = @(Get-ConversationAttributeKeys -Conversations $script:allConversations.ToArray())
 
         $popup = New-Object System.Windows.Window
-        $popup.Title = 'Select Attribute Columns to Include'
-        $popup.Width = 420; $popup.Height = 540
+        $popup.Title = 'Select Columns'
+        $popup.Width = 560; $popup.Height = 640
         $popup.WindowStartupLocation = 'CenterOwner'; $popup.Owner = $window
-        $popup.ResizeMode = 'NoResize'
 
         $outerGrid = New-Object System.Windows.Controls.Grid
-        $r0 = New-Object System.Windows.Controls.RowDefinition; $r0.Height = [System.Windows.GridLength]::Star
-        $r1 = New-Object System.Windows.Controls.RowDefinition; $r1.Height = [System.Windows.GridLength]::Auto
-        $outerGrid.RowDefinitions.Add($r0); $outerGrid.RowDefinitions.Add($r1)
+        foreach ($height in @('Auto', '*', 'Auto')) {
+            $rowDef = New-Object System.Windows.Controls.RowDefinition
+            $rowDef.Height = if ($height -eq '*') { [System.Windows.GridLength]::new(1, 'Star') } else { [System.Windows.GridLength]::Auto }
+            $outerGrid.RowDefinitions.Add($rowDef)
+        }
         $popup.Content = $outerGrid
 
-        $scroll = New-Object System.Windows.Controls.ScrollViewer; $scroll.VerticalScrollBarVisibility = 'Auto'
-        $inner = New-Object System.Windows.Controls.StackPanel; $inner.Margin = [System.Windows.Thickness]::new(10)
-        $scroll.Content = $inner
-        [System.Windows.Controls.Grid]::SetRow($scroll, 0); $outerGrid.Children.Add($scroll) | Out-Null
-
-        # Search box
         $searchBox = New-Object System.Windows.Controls.TextBox
-        $searchBox.Margin = [System.Windows.Thickness]::new(0, 0, 0, 6)
-        $searchBox.ToolTip = 'Filter attribute list'
-        $inner.Children.Add($searchBox) | Out-Null
+        $searchBox.Margin = [System.Windows.Thickness]::new(8, 8, 8, 4)
+        $searchBox.ToolTip = 'Filter columns by name or description'
+        [System.Windows.Controls.Grid]::SetRow($searchBox, 0); $outerGrid.Children.Add($searchBox) | Out-Null
 
-        $cbList = [System.Collections.Generic.List[System.Windows.Controls.CheckBox]]::new()
+        $tabs = New-Object System.Windows.Controls.TabControl
+        $tabs.Margin = [System.Windows.Thickness]::new(8, 0, 8, 0)
+        [System.Windows.Controls.Grid]::SetRow($tabs, 1); $outerGrid.Children.Add($tabs) | Out-Null
 
-        function Render-AttrList {
-            param([string]$Filter = '')
-            $inner.Children.Clear()
-            $inner.Children.Add($searchBox) | Out-Null
-            $cbList.Clear()
-            foreach ($k in $allKeys) {
-                if ($Filter -and $k -notlike "*$Filter*") { continue }
-                $cb = New-Object System.Windows.Controls.CheckBox
-                $cb.Content = $k; $cb.Tag = $k
-                $cb.Margin = [System.Windows.Thickness]::new(0, 1, 0, 1)
-                $cb.IsChecked = $script:selectedAttrCols -contains $k
-                $inner.Children.Add($cb) | Out-Null
-                $cbList.Add($cb) | Out-Null
-            }
+        $stdBoxes = [System.Collections.Generic.List[System.Windows.Controls.CheckBox]]::new()
+        $attrBoxes = [System.Collections.Generic.List[System.Windows.Controls.CheckBox]]::new()
+
+        # -- Standard columns tab
+        $stdDock = New-Object System.Windows.Controls.DockPanel
+        $stdButtons = New-Object System.Windows.Controls.WrapPanel
+        [System.Windows.Controls.DockPanel]::SetDock($stdButtons, 'Top')
+        $stdDock.Children.Add($stdButtons) | Out-Null
+        $stdScroll = New-Object System.Windows.Controls.ScrollViewer; $stdScroll.VerticalScrollBarVisibility = 'Auto'
+        $stdList = New-Object System.Windows.Controls.StackPanel; $stdList.Margin = [System.Windows.Thickness]::new(6)
+        $stdScroll.Content = $stdList
+        $stdDock.Children.Add($stdScroll) | Out-Null
+        foreach ($name in $standardColumns) {
+            $label = New-Object System.Windows.Controls.TextBlock
+            $label.Inlines.Add((New-Object System.Windows.Documents.Run($name))) | Out-Null
+            $descriptionRun = New-Object System.Windows.Documents.Run("  $(Get-ColumnDescription -Name $name)")
+            $descriptionRun.Foreground = [System.Windows.Media.Brushes]::Gray
+            $label.Inlines.Add($descriptionRun) | Out-Null
+            $cb = New-Object System.Windows.Controls.CheckBox
+            $cb.Content = $label; $cb.Tag = $name
+            $cb.Margin = [System.Windows.Thickness]::new(0, 1, 0, 1)
+            $cb.IsChecked = $script:visibleStdCols -contains $name
+            $stdList.Children.Add($cb) | Out-Null
+            $stdBoxes.Add($cb) | Out-Null
         }
+        foreach ($spec in @(@('Defaults', 'defaults'), @('Select all shown', 'all'), @('Clear all shown', 'none'))) {
+            $btn = New-Object System.Windows.Controls.Button
+            $btn.Content = $spec[0]; $btn.Tag = $spec[1]
+            $btn.Add_Click({
+                    param($buttonSender)
+                    $mode = [string]$buttonSender.Tag
+                    $defaults = @(Get-DefaultGridColumnNames)
+                    foreach ($box in $stdBoxes) {
+                        if ($mode -eq 'defaults') { $box.IsChecked = $defaults -contains [string]$box.Tag }
+                        elseif ($box.Visibility -eq 'Visible') { $box.IsChecked = ($mode -eq 'all') }
+                    }
+                })
+            $stdButtons.Children.Add($btn) | Out-Null
+        }
+        $stdTab = New-Object System.Windows.Controls.TabItem
+        $stdTab.Header = "Standard columns ($($standardColumns.Count))"
+        $stdTab.Content = $stdDock
+        $tabs.Items.Add($stdTab) | Out-Null
 
-        Render-AttrList
+        # -- Attribute columns tab
+        $attrScroll = New-Object System.Windows.Controls.ScrollViewer; $attrScroll.VerticalScrollBarVisibility = 'Auto'
+        $attrList = New-Object System.Windows.Controls.StackPanel; $attrList.Margin = [System.Windows.Thickness]::new(6)
+        $attrScroll.Content = $attrList
+        if ($attributeKeys.Count -eq 0) {
+            $none = New-Object System.Windows.Controls.TextBlock
+            $none.Text = 'No participant attributes found. Load results first.'
+            $none.Foreground = [System.Windows.Media.Brushes]::Gray
+            $attrList.Children.Add($none) | Out-Null
+        }
+        foreach ($key in $attributeKeys) {
+            $cb = New-Object System.Windows.Controls.CheckBox
+            $cb.Content = $key; $cb.Tag = $key
+            $cb.Margin = [System.Windows.Thickness]::new(0, 1, 0, 1)
+            $cb.IsChecked = $script:selectedAttrCols -contains $key
+            $attrList.Children.Add($cb) | Out-Null
+            $attrBoxes.Add($cb) | Out-Null
+        }
+        $attrTab = New-Object System.Windows.Controls.TabItem
+        $attrTab.Header = "Attributes ($($attributeKeys.Count))"
+        $attrTab.Content = $attrScroll
+        $tabs.Items.Add($attrTab) | Out-Null
 
-        $searchBox.Add_TextChanged({ Render-AttrList -Filter $searchBox.Text }.GetNewClosure())
+        # Filter by hiding non-matching boxes (keeps checked state intact)
+        $searchBox.Add_TextChanged({
+                $filter = $searchBox.Text
+                foreach ($box in @($stdBoxes) + @($attrBoxes)) {
+                    $haystack = [string]$box.Tag
+                    if ($box.Content -is [System.Windows.Controls.TextBlock]) { $haystack = $haystack + ' ' + (Get-ColumnDescription -Name ([string]$box.Tag)) }
+                    $box.Visibility = if ([string]::IsNullOrWhiteSpace($filter) -or $haystack -like "*$filter*") { 'Visible' } else { 'Collapsed' }
+                }
+            })
 
         $btnRow = New-Object System.Windows.Controls.StackPanel
         $btnRow.Orientation = 'Horizontal'; $btnRow.HorizontalAlignment = 'Right'
-        $btnRow.Margin = [System.Windows.Thickness]::new(6)
-        [System.Windows.Controls.Grid]::SetRow($btnRow, 1); $outerGrid.Children.Add($btnRow) | Out-Null
+        $btnRow.Margin = [System.Windows.Thickness]::new(8)
+        [System.Windows.Controls.Grid]::SetRow($btnRow, 2); $outerGrid.Children.Add($btnRow) | Out-Null
 
-        $applyBtn = New-Object System.Windows.Controls.Button; $applyBtn.Content = 'Apply & Refresh'; $applyBtn.Width = 110
+        $applyBtn = New-Object System.Windows.Controls.Button; $applyBtn.Content = 'Apply & Refresh'; $applyBtn.Width = 120
         $applyBtn.Add_Click({
+                $script:visibleStdCols.Clear()
+                foreach ($box in $stdBoxes) { if ($box.IsChecked) { $script:visibleStdCols.Add([string]$box.Tag) | Out-Null } }
                 $script:selectedAttrCols.Clear()
-                foreach ($cb in @($cbList)) {
-                    if ($cb.IsChecked) { $script:selectedAttrCols.Add([string]$cb.Tag) | Out-Null }
-                }
+                foreach ($box in $attrBoxes) { if ($box.IsChecked) { $script:selectedAttrCols.Add([string]$box.Tag) | Out-Null } }
                 $popup.Close()
                 if ($script:allConversations.Count -gt 0) { Show-Results }
-            }.GetNewClosure())
+            })
         $btnRow.Children.Add($applyBtn) | Out-Null
 
         $cancelBtn = New-Object System.Windows.Controls.Button; $cancelBtn.Content = 'Cancel'; $cancelBtn.Width = 70; $cancelBtn.Margin = [System.Windows.Thickness]::new(4, 0, 0, 0)
@@ -1977,7 +2216,6 @@ $columnSelectorBtn.Add_Click({
 
         $popup.ShowDialog() | Out-Null
     })
-
 # -- Export CSV ----------------------------------------------------------------
 
 $exportCsvBtn.Add_Click({
@@ -1990,15 +2228,20 @@ $exportCsvBtn.Add_Click({
         if ($dlg.ShowDialog() -ne 'OK') { return }
 
         try {
+            # Every standard column (not just the visible ones) plus selected attribute columns.
             $attrCols = @($script:selectedAttrCols)
-            $script:allConversations |
+            $sensitiveColumns = @((Get-FlatRowColumnNames) + @($attrCols | ForEach-Object { "A:$_" }) | Where-Object { Test-SensitiveKey -Key $_ })
+            $exported = 0
+            $script:allConversations.ToArray() |
                 ForEach-Object {
-                    $row = ConvertTo-FlatRow -Conv $_ -AttrCols $attrCols
+                    $row = ConvertTo-FlatRow -ConversationProfile (Get-CachedConversationProfile -Conv $_) -Conversation $_ -AttrCols $attrCols -Lookups $script:lookups
                     if ($script:exportRedactionMode) {
-                        foreach ($property in @($row.PSObject.Properties)) {
-                            $property.Value = Protect-ScalarValue -Value $property.Value -Key $property.Name
+                        foreach ($columnName in $sensitiveColumns) {
+                            $row.$columnName = Protect-ScalarValue -Value $row.$columnName -Key $columnName
                         }
                     }
+                    $exported++
+                    if ($exported % 1000 -eq 0) { Set-Status "Exporting CSV... $exported rows"; [System.Windows.Forms.Application]::DoEvents() }
                     $row
                 } |
                 Export-Csv -Path $dlg.FileName -NoTypeInformation -Encoding UTF8
@@ -2068,6 +2311,9 @@ $loadJsonlBtn.Add_Click({
                     'Partial Load Warnings', 'OK', 'Warning') | Out-Null
             }
 
+            $script:dataSource = "File $([System.IO.Path]::GetFileName($dlg.FileName))"
+            $script:dataQueryInterval = ''
+            if (-not $script:lookupsLoaded -and -not [string]::IsNullOrWhiteSpace($script:accessToken)) { Update-ReferenceLookups | Out-Null }
             Show-Results
             $mainTabControl.SelectedIndex = 2
 
@@ -2088,12 +2334,42 @@ $clearResultsBtn.Add_Click({
         $resultsGrid.Columns.Clear()
         $summaryText.Text = 'Results cleared.'
         $overviewPanel.Children.Clear()
-        $attributesGrid.ItemsSource = $null
-        $participantsGrid.ItemsSource = $null
-        $segmentsGrid.ItemsSource = $null
+        foreach ($detailGrid in @($attributesGrid, $participantsGrid, $segmentsGrid, $metricsGrid, $flowsGrid)) { Set-GridRows -Grid $detailGrid -Rows $null }
         $rawJsonBox.Text = ''
+        $script:dataSource = ''
+        $script:dataQueryInterval = ''
+        Clear-ReportView
         Set-Status 'Results cleared.'
     })
+
+# -- Resolve names / report ------------------------------------------------------
+
+$resolveNamesBtn.Add_Click({
+        if ([string]::IsNullOrWhiteSpace($script:accessToken)) {
+            [System.Windows.MessageBox]::Show('Authenticate first - names are looked up from your Genesys Cloud org.', 'Resolve Names', 'OK', 'Information') | Out-Null
+            return
+        }
+        $resolveNamesBtn.IsEnabled = $false
+        try {
+            $loaded = Update-ReferenceLookups -Force
+            if ($script:allConversations.Count -gt 0) { Show-Results }
+            if (-not $loaded) {
+                [System.Windows.MessageBox]::Show('No reference names could be loaded. See the Job Monitor activity log for the API errors (often a missing permission).', 'Resolve Names', 'OK', 'Warning') | Out-Null
+            }
+        }
+        finally { $resolveNamesBtn.IsEnabled = $true }
+    })
+
+$refreshReportBtn.Add_Click({
+        if ($script:allConversations.Count -eq 0) {
+            [System.Windows.MessageBox]::Show('No results loaded.', 'Report', 'OK', 'Information') | Out-Null
+            return
+        }
+        Update-ReportView -Force
+        Set-Status 'Report refreshed.'
+    })
+
+$exportReportBtn.Add_Click({ Export-ReportFile })
 
 # -----------------------------------------------------------------------------
 # Startup: load persisted config + auto-auth

@@ -405,7 +405,7 @@ function Invoke-UiApiRequest {
     if ($QueryParams -and $QueryParams.Count -gt 0) {
         $qs = ($QueryParams.GetEnumerator() |
             ForEach-Object { "$($_.Key)=$([Uri]::EscapeDataString([string]$_.Value))" }) -join '&'
-        $uri = "$uri?$qs"
+        $uri = "${uri}?$qs"
     }
 
     $request = [ordered]@{
