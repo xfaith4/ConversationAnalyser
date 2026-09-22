@@ -13,7 +13,7 @@
 
     Units: analytics metrics arrive in milliseconds. Everything surfaced here is in
     seconds unless the column name says otherwise (for example MaxLatencyMs).
-    Name lookups (queues, wrap-up codes, divisions, skills, languages) are optional;
+    Name lookups (queues, wrap-up codes, divisions, skills, languages, users) are optional;
     when an ID is not in the lookup table the raw ID is shown instead.
 
     Compatible with Windows PowerShell 5.1 and PowerShell 7+. Keep this file ASCII-only
@@ -41,12 +41,52 @@ foreach ($name in @('nOffered', 'tAnswered', 'tAbandon', 'tShortAbandon', 'nOver
 
 $script:caBarChar = [string][char]0x2588
 
+# Plain-language meaning for segment error codes that matter operationally. Exact codes first,
+# then family prefixes. Full list: https://help.genesys.cloud/articles/error-codes/
+$script:caErrorCodeMeanings = [ordered]@{
+    'error.ininedgecontrol.connection.webrtc.endpoint.disconnect.iceIdleDetection'  = 'Agent WebRTC phone: media path went idle (ICE) - agent network drop, NAT/VPN idle timeout, or sleeping workstation.'
+    'error.ininedgecontrol.connection.webrtc.endpoint.disconnect.dtlsPeerDisconnect' = 'Agent WebRTC phone: secure media session (DTLS) dropped by the endpoint - browser/desktop app closed or lost network.'
+}
+$script:caErrorCodePrefixMeanings = [ordered]@{
+    'error.ininedgecontrol.connection.webrtc.' = 'Agent WebRTC phone connection error.'
+    'error.ininedgecontrol.'                   = 'Edge / telephony (Edge Control) error.'
+}
+
+function Get-ErrorCodeMeaning {
+    param([string]$Code)
+    if ([string]::IsNullOrWhiteSpace($Code)) { return '' }
+    if ($script:caErrorCodeMeanings.Contains($Code)) { return [string]$script:caErrorCodeMeanings[$Code] }
+    foreach ($prefix in $script:caErrorCodePrefixMeanings.Keys) {
+        if ($Code.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return [string]$script:caErrorCodePrefixMeanings[$prefix] }
+    }
+    return ''
+}
+
 # -----------------------------------------------------------------------------
 # Small helpers
 # -----------------------------------------------------------------------------
 
 function New-ConversationLookupTable {
-    return @{ queues = @{}; wrapupCodes = @{}; divisions = @{}; skills = @{}; languages = @{} }
+    return @{ queues = @{}; wrapupCodes = @{}; divisions = @{}; skills = @{}; languages = @{}; users = @{} }
+}
+
+function Get-ConversationUserIds {
+    # Distinct user IDs of agent/user participants across the conversations, in first-seen order.
+    # Feeds the users lookup so only the people who appear in the data are fetched.
+    param([object[]]$Conversations)
+    $seen = @{}
+    $ids = [System.Collections.Generic.List[string]]::new()
+    foreach ($conv in $Conversations) {
+        if ($null -eq $conv) { continue }
+        foreach ($p in $conv.participants) {
+            if (-not $script:caAgentPurposes[[string]$p.purpose]) { continue }
+            $userId = [string]$p.userId
+            if ([string]::IsNullOrWhiteSpace($userId) -or $seen.ContainsKey($userId)) { continue }
+            $seen[$userId] = $true
+            $ids.Add($userId) | Out-Null
+        }
+    }
+    return $ids.ToArray()
 }
 
 function ConvertTo-UtcDateTime {
@@ -124,6 +164,26 @@ function Resolve-LookupNameList {
         $names.Add((Resolve-LookupName -Lookups $Lookups -Kind $Kind -Id ([string]$id))) | Out-Null
     }
     return ($names -join $Separator)
+}
+
+function Resolve-AgentLabel {
+    # Display name for an agent key (user ID, or participantName when the record has no user ID).
+    # The users lookup (org directory) wins over the participantName captured on the record, which
+    # analytics often leaves blank for agents; the raw key is the last resort.
+    param([hashtable]$Lookups, [hashtable]$AgentNames, [string]$Key)
+    if ([string]::IsNullOrEmpty($Key)) { return '' }
+    if ($null -ne $Lookups) {
+        $map = $Lookups['users']
+        if ($null -ne $map -and $map.ContainsKey($Key)) {
+            $name = [string]$map[$Key]
+            if (-not [string]::IsNullOrWhiteSpace($name)) { return $name }
+        }
+    }
+    if ($null -ne $AgentNames -and $AgentNames.ContainsKey($Key)) {
+        $name = [string]$AgentNames[$Key]
+        if (-not [string]::IsNullOrWhiteSpace($name)) { return $name }
+    }
+    return $Key
 }
 
 function Get-IdsOrderedByTime {
@@ -208,6 +268,8 @@ function Get-ConversationProfile {
     $finalDisconnect = $null
     $fallbackDisconnect = $null
     $errorCodes = [ordered]@{}   # ordered set: key order = first seen
+    $errorEvents = [System.Collections.Generic.List[object]]::new()   # one per segment carrying an errorCode
+    $errorDisconnect = $false
     $sipCodes = [ordered]@{}   # ordered set: key order = first seen
     $q850Codes = [ordered]@{}   # ordered set: key order = first seen
     $skillIds = [ordered]@{}   # ordered set: key order = first seen
@@ -341,8 +403,13 @@ function Get-ConversationProfile {
                     }
                 }
 
+                if ($disconnectType -eq 'error') { $errorDisconnect = $true }
                 $errorCode = [string]$seg.errorCode
-                if ($errorCode) { $errorCodes[$errorCode] = $true }
+                if ($errorCode) {
+                    $errorCodes[$errorCode] = $true
+                    # Kept per segment so the report can say who carried the error and how that leg ended.
+                    $errorEvents.Add([pscustomobject]@{ Code = $errorCode; Purpose = $purpose; DisconnectType = $disconnectType; MediaType = $sessionMedia; SegmentType = $segType; Time = $eventTime }) | Out-Null
+                }
                 foreach ($code in $seg.sipResponseCodes) {
                     $codeText = [string]$code
                     if ($codeText) { $sipCodes[$codeText] = $true }
@@ -487,6 +554,9 @@ function Get-ConversationProfile {
         NpsScore              = if ($npsCount -gt 0) { [Math]::Round($npsSum / $npsCount, 1) } else { $null }
         ResolutionCount       = $resolutionCount
         ErrorCodes            = @($errorCodes.Keys)
+        ErrorEvents           = @($errorEvents)
+        ErrorSegmentCount     = $errorEvents.Count
+        ErrorDisconnect       = $errorDisconnect
         SipCodes              = @($sipCodes.Keys)
         Q850Codes             = @($q850Codes.Keys)
         Sessions              = $sessionFacts
@@ -587,7 +657,9 @@ $script:caColumnDescriptions = [ordered]@{
     SurveyScore           = 'Average survey total score.'
     NpsScore              = 'Average survey promoter (NPS) score, 0-10.'
     Resolutions           = 'Resolution records linked to the conversation.'
-    ErrorCodes            = 'Segment error codes.'
+    ErrorCodes            = 'Segment error codes (for example error.ininedgecontrol.connection.webrtc.endpoint.disconnect.iceIdleDetection). Reference: help.genesys.cloud/articles/error-codes/'
+    ErrorSegments         = 'Number of segments carrying an error code.'
+    ErrorDisconnect       = 'True when any segment ended with disconnectType error.'
     SipCodes              = 'SIP response codes.'
     Q850Codes             = 'Q.850 cause codes.'
     ParticipantCount      = 'Number of participants.'
@@ -597,7 +669,7 @@ $script:caColumnDescriptions = [ordered]@{
 
 $script:caDefaultGridColumns = @(
     'ConversationId', 'Start', 'DurationSec', 'Direction', 'MediaType', 'QueueName', 'AgentName',
-    'WrapUpCode', 'DisconnectedBy', 'Answered', 'Abandoned', 'Transferred', 'HoldCount',
+    'WrapUpCode', 'DisconnectedBy', 'DisconnectType', 'ErrorCodes', 'Answered', 'Abandoned', 'Transferred', 'HoldCount',
     'tAnsweredSec', 'tTalkSec', 'tHeldSec', 'tAcwSec', 'tHandleSec', 'MinMos')
 
 function Get-FlatRowColumnNames { return @($script:caColumnDescriptions.Keys) }
@@ -663,8 +735,16 @@ function ConvertTo-FlatRow {
     $counts = $cp.MetricCounts
     $firstQueueId = if ($cp.QueueIds.Count -gt 0) { $cp.QueueIds[0] } else { '' }
     $firstAgentKey = if ($cp.AgentKeys.Count -gt 0) { $cp.AgentKeys[0] } else { '' }
-    $finalAgentKey = if ($cp.AgentKeys.Count -gt 0) { $cp.AgentKeys[$cp.AgentKeys.Count - 1] } else { '' }
-    $agentLabels = @(foreach ($key in $cp.AgentKeys) { if ($cp.AgentNames.ContainsKey($key)) { [string]$cp.AgentNames[$key] } else { $key } })
+    # Users lookup wins over the participantName on the record (often blank for agents), then the raw key.
+    $agentNames = $cp.AgentNames
+    $userNames = if ($null -ne $Lookups) { $Lookups['users'] } else { $null }
+    $agentLabels = @(foreach ($key in $cp.AgentKeys) {
+            if ($null -ne $userNames -and $userNames.ContainsKey($key) -and -not [string]::IsNullOrWhiteSpace([string]$userNames[$key])) { [string]$userNames[$key] }
+            elseif ($agentNames.ContainsKey($key)) { [string]$agentNames[$key] }
+            else { $key }
+        })
+    $firstAgentLabel = if ($agentLabels.Count -gt 0) { $agentLabels[0] } else { '' }
+    $finalAgentLabel = if ($agentLabels.Count -gt 0) { $agentLabels[$agentLabels.Count - 1] } else { '' }
 
     # Precomputed once per row; a missing key yields $null (metric never emitted).
     $secs = @{}
@@ -712,9 +792,9 @@ function ConvertTo-FlatRow {
         UsedRouting           = $cp.UsedRouting
         RequestedSkills       = $skillLabels -join ', '
         RequestedLanguage     = $languageLabels -join ', '
-        AgentName             = if ($firstAgentKey -and $cp.AgentNames.ContainsKey($firstAgentKey)) { [string]$cp.AgentNames[$firstAgentKey] } else { $firstAgentKey }
+        AgentName             = $firstAgentLabel
         AgentUserId           = $firstAgentKey
-        FinalAgent            = if ($finalAgentKey -and $cp.AgentNames.ContainsKey($finalAgentKey)) { [string]$cp.AgentNames[$finalAgentKey] } else { $finalAgentKey }
+        FinalAgent            = $finalAgentLabel
         AgentPath             = $agentLabels -join ' > '
         AgentCount            = $cp.AgentKeys.Count
         CustomerName          = $cp.CustomerName
@@ -780,6 +860,8 @@ function ConvertTo-FlatRow {
         NpsScore              = $cp.NpsScore
         Resolutions           = $cp.ResolutionCount
         ErrorCodes            = $cp.ErrorCodes -join ', '
+        ErrorSegments         = $cp.ErrorSegmentCount
+        ErrorDisconnect       = $cp.ErrorDisconnect
         SipCodes              = $cp.SipCodes -join ', '
         Q850Codes             = $cp.Q850Codes -join ', '
         ParticipantCount      = $cp.ParticipantCount
@@ -902,6 +984,10 @@ function Get-ConversationSessionRows {
     $participantIndex = 0
     foreach ($p in $Conversation.participants) {
         $participantIndex++
+        $displayName = [string]$p.participantName
+        if ($script:caAgentPurposes[[string]$p.purpose] -and -not [string]::IsNullOrWhiteSpace([string]$p.userId)) {
+            $displayName = Resolve-AgentLabel -Lookups $Lookups -AgentNames @{ ([string]$p.userId) = $displayName } -Key ([string]$p.userId)
+        }
         foreach ($s in $p.sessions) {
             $metrics = Get-SessionMetricMap -Session $s
             $queueId = ''
@@ -914,7 +1000,7 @@ function Get-ConversationSessionRows {
             $rows.Add([pscustomobject]@{
                     Participant = $participantIndex
                     Purpose     = [string]$p.purpose
-                    Name        = [string]$p.participantName
+                    Name        = $displayName
                     Media       = [string]$s.mediaType
                     Direction   = [string]$s.direction
                     Queue       = Resolve-LookupName -Lookups $Lookups -Kind 'queues' -Id $queueId
@@ -1105,6 +1191,8 @@ function Get-ConversationReport {
     $durationItems = [System.Collections.Generic.List[object]]::new()
     $mosKeys = [System.Collections.Generic.List[double]]::new()
     $mosItems = [System.Collections.Generic.List[object]]::new()
+    $errorItems = [System.Collections.Generic.List[object]]::new()   # profiles with at least one segment error code
+    $byErrorCode = [ordered]@{}                                        # code -> counts and the purposes / disconnects / media seen with it
     $groups = [System.Collections.Generic.List[double[]]]::new()
     $windowStart = $null; $windowEnd = $null
 
@@ -1154,6 +1242,19 @@ function Get-ConversationReport {
             $durationSum += $duration; $durationN++
             $durations.Add([double]$duration)
             $durationKeys.Add([double]$duration); $durationItems.Add($cp)
+        }
+        if ($cp.ErrorCodes.Count -gt 0) {
+            $errorItems.Add($cp)
+            $seenCodes = @{}
+            foreach ($ev in @($cp.ErrorEvents)) {
+                $e = $byErrorCode[$ev.Code]
+                if ($null -eq $e) { $e = @{ Conversations = 0; Segments = 0; Purposes = [ordered]@{}; DisconnectTypes = [ordered]@{}; Media = [ordered]@{} }; $byErrorCode[$ev.Code] = $e }
+                if (-not $seenCodes.ContainsKey($ev.Code)) { $seenCodes[$ev.Code] = $true; $e.Conversations++ }
+                $e.Segments++
+                if ($ev.Purpose) { $e.Purposes[[string]$ev.Purpose] = $true }
+                if ($ev.DisconnectType) { $e.DisconnectTypes[[string]$ev.DisconnectType] = $true }
+                if ($ev.MediaType) { $e.Media[[string]$ev.MediaType] = $true }
+            }
         }
         if ($cp.SelfServed) { $selfServed++ }
         if ($cp.Voicemail) { $voicemails++ }
@@ -1336,7 +1437,7 @@ function Get-ConversationReport {
     $rows = foreach ($key in $byAgent.Keys) {
         $a = $byAgent[$key]
         [pscustomobject]@{
-            Agent          = if ($agentLabels.ContainsKey($key)) { [string]$agentLabels[$key] } else { $key }
+            Agent          = Resolve-AgentLabel -Lookups $Lookups -AgentNames $agentLabels -Key $key
             Conversations  = [int]$a[$aConv]
             Handled        = [int]$a[$aHandle + 1]
             AhtSec         = Get-StatAverage $a $aHandle 1000
@@ -1443,6 +1544,21 @@ function Get-ConversationReport {
     }
     $tables['Disconnects'] = [pscustomobject]@{ Description = 'Who ended each conversation: the latest non-peer, non-transfer disconnect (endpoint = hung up, client = agent UI, system/error/timeout = platform).'; Rows = @($rows | Sort-Object -Property @{ Expression = 'Conversations'; Descending = $true }) }
 
+    $rows = foreach ($code in $byErrorCode.Keys) {
+        $e = $byErrorCode[$code]
+        [pscustomobject]@{
+            ErrorCode       = $code
+            Conversations   = [int]$e.Conversations
+            SharePct        = Get-Percent $e.Conversations $total
+            Segments        = [int]$e.Segments
+            Purposes        = @($e.Purposes.Keys) -join ', '
+            DisconnectTypes = @($e.DisconnectTypes.Keys) -join ', '
+            MediaTypes      = @($e.Media.Keys) -join ', '
+            Meaning         = Get-ErrorCodeMeaning -Code $code
+        }
+    }
+    $tables['Error Codes'] = [pscustomobject]@{ Description = 'Every segment errorCode seen, with who carried the segment (Purposes) and how that leg ended (DisconnectTypes). Share is of all conversations. Reference: https://help.genesys.cloud/articles/error-codes/'; Rows = @($rows | Sort-Object -Property @{ Expression = 'Conversations'; Descending = $true }) }
+
     $rows = foreach ($key in $byFlow.Keys) {
         $g = $byFlow[$key]; $count = [int]$g[$gConv]; $contained = [int]$g[$gContained]
         [pscustomobject]@{
@@ -1485,7 +1601,7 @@ function Get-ConversationReport {
             MediaType      = $cp.MediaType
             Direction      = $cp.Direction
             Queue          = if ($cp.QueueIds.Count -gt 0) { Resolve-LookupName -Lookups $Lookups -Kind 'queues' -Id $cp.QueueIds[0] } else { '' }
-            Agent          = if ($cp.AgentKeys.Count -gt 0 -and $cp.AgentNames.ContainsKey($cp.AgentKeys[0])) { [string]$cp.AgentNames[$cp.AgentKeys[0]] } elseif ($cp.AgentKeys.Count -gt 0) { $cp.AgentKeys[0] } else { '' }
+            Agent          = if ($cp.AgentKeys.Count -gt 0) { Resolve-AgentLabel -Lookups $Lookups -AgentNames $cp.AgentNames -Key $cp.AgentKeys[0] } else { '' }
             DisconnectedBy = $cp.DisconnectPurpose
             Codecs         = $cp.Codecs -join ', '
         }
@@ -1505,6 +1621,24 @@ function Get-ConversationReport {
         for ($i = 0; $i -lt [Math]::Min(25, $items.Length); $i++) { $lowestMos.Add((& $outlierRow $items[$i])) | Out-Null }
     }
     $tables['Lowest MOS'] = [pscustomobject]@{ Description = 'The 25 conversations with the lowest minimum MOS, for voice-quality follow-up.'; Rows = @($lowestMos) }
+
+    $errorRows = [System.Collections.Generic.List[object]]::new()
+    foreach ($cp in ($errorItems | Sort-Object -Property @{ Expression = 'StartUtc'; Descending = $true } | Select-Object -First 25)) {
+        $errorRows.Add([pscustomobject]@{
+                ConversationId = $cp.ConversationId
+                Start          = Format-LocalTimestamp $cp.StartUtc
+                DurationSec    = $cp.DurationSec
+                MediaType      = $cp.MediaType
+                Direction      = $cp.Direction
+                Queue          = if ($cp.QueueIds.Count -gt 0) { Resolve-LookupName -Lookups $Lookups -Kind 'queues' -Id $cp.QueueIds[0] } else { '' }
+                Agent          = if ($cp.AgentKeys.Count -gt 0) { Resolve-AgentLabel -Lookups $Lookups -AgentNames $cp.AgentNames -Key $cp.AgentKeys[0] } else { '' }
+                DisconnectedBy = $cp.DisconnectPurpose
+                DisconnectType = $cp.DisconnectType
+                ErrorSegments  = $cp.ErrorSegmentCount
+                ErrorCodes     = $cp.ErrorCodes -join ', '
+            }) | Out-Null
+    }
+    $tables['Error Conversations'] = [pscustomobject]@{ Description = "The 25 most recent conversations carrying a segment error code ($($errorItems.Count) in total), for drill-down in the Results tab."; Rows = @($errorRows) }
 
     # -- Observations (rule-based, with the reference threshold stated in each line)
     $observations = [System.Collections.Generic.List[string]]::new()
@@ -1536,6 +1670,18 @@ function Get-ConversationReport {
     $systemPct = Get-Percent $systemEnds $total
     if ($null -ne $systemPct -and $systemPct -ge 5) {
         $observations.Add("$systemPct% of conversations ended with a system, error, or timeout disconnect (5% reference).") | Out-Null
+    }
+    if ($errorItems.Count -gt 0) {
+        $errorPct = Get-Percent $errorItems.Count $total
+        $topCode = @($tables['Error Codes'].Rows | Select-Object -First 1)
+        $topText = if ($topCode.Count -gt 0) { " Most common: $($topCode[0].ErrorCode) ($($topCode[0].Conversations))." } else { '' }
+        $observations.Add("$($errorItems.Count) conversations ($errorPct%) carry a segment error code.$topText See the Error Codes and Error Conversations tables.") | Out-Null
+        $webrtcRows = @($tables['Error Codes'].Rows | Where-Object { $_.ErrorCode -like '*.webrtc.endpoint.disconnect.*' })
+        if ($webrtcRows.Count -gt 0) {
+            $webrtcConvs = @($errorItems | Where-Object { @($_.ErrorCodes | Where-Object { $_ -like '*.webrtc.endpoint.disconnect.*' }).Count -gt 0 }).Count
+            $detail = ($webrtcRows | ForEach-Object { "$($_.ErrorCode.Split('.')[-1]) $($_.Conversations)" }) -join ', '
+            $observations.Add("Agent WebRTC phone drops in $webrtcConvs conversations ($detail). Check agent network stability, VPN/NAT idle timeouts, and workstation sleep settings.") | Out-Null
+        }
     }
     $peak = @($tables['Hourly'].Rows | Sort-Object Conversations -Descending | Select-Object -First 1)
     if ($peak.Count -gt 0) {

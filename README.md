@@ -8,8 +8,11 @@ collection-level report.
 ## Files
 
 - `GenesysConvAnalyzer.ps1` - main WPF app
+- `src/auth/PkceAuth.ps1` - OAuth 2.0 Authorization Code + PKCE (browser sign-in, local callback listener, token exchange/refresh; no UI code)
 - `src/ui/UiApiRetry.ps1` - retry/backoff helper used by the app
 - `src/analysis/ConversationAnalysis.ps1` - field extraction, flat rows, report aggregation, and HTML/JSON rendering (no UI or network code)
+- `GenesysConvAnalyzer.config.example.json` - template for the per-machine config file
+- `tests/PkceAuth.Tests.ps1` - Pester tests for the PKCE helpers
 
 ## Run
 
@@ -20,7 +23,57 @@ collection-level report.
 Or specify a config file:
 
 ```powershell
-.\GenesysConvAnalyzer.ps1 -ConfigPath .\GenesysCore-GUI.config.json
+.\GenesysConvAnalyzer.ps1 -ConfigPath .\GenesysConvAnalyzer.config.json
+```
+
+## Authentication (PKCE)
+
+The app signs in through your browser using the OAuth 2.0 Authorization Code grant with
+PKCE ([Genesys docs](https://developer.genesys.cloud/authorization/platform-auth/use-pkce)).
+Users never handle a client secret: the token belongs to the signed-in user and carries
+that user's permissions, so they need analytics permissions in Genesys Cloud.
+
+### One-time setup (admin)
+
+1. In Genesys Cloud, go to **Admin > Integrations > OAuth** and add a client with grant
+   type **Code Authorization**. No secret is used by this app.
+2. Add `http://localhost:8085/callback/` as an **Authorized redirect URI** (any free
+   port works; keep it identical to the value configured below).
+3. Give users the **Client ID** and redirect URI. Neither is a secret.
+
+### Where the Client ID and redirect URI come from
+
+Highest precedence first:
+
+1. Environment variables `GENESYS_CLIENT_ID`, `GENESYS_REDIRECT_URI`, `GENESYS_SCOPE`,
+   `GENESYS_AUTH_MODE`, `GENESYS_REGION`.
+2. The config file next to the script. Copy `GenesysConvAnalyzer.config.example.json` to
+   `GenesysConvAnalyzer.config.json` and fill it in. The real file is git-ignored.
+3. `$script:AuthDefaults` near the top of `GenesysConvAnalyzer.ps1`, for a build that ships
+   with the values baked in.
+
+The app writes the region, client ID, and redirect URI back to the config file after a
+successful sign-in. It never writes a secret.
+
+### Sign-in flow
+
+Click **Sign in**. The app starts a listener on the redirect URI, opens the Genesys login
+page in your default browser, captures the returned code, and exchanges it for a token.
+Clicking **Sign in** again uses the refresh token silently when the OAuth client has
+refresh tokens enabled, and falls back to the browser otherwise. If the listener port is
+already in use, a prompt asks you to paste the redirect URL from the browser instead.
+
+### Client credentials (automation only)
+
+Set `authMode` to `client_credentials` (config file or `GENESYS_AUTH_MODE`) and provide the
+secret through the `GENESYS_CLIENT_SECRET` environment variable. The UI has no secret
+field and the secret is never stored. With both values present the app authenticates on
+startup.
+
+### Tests
+
+```powershell
+Invoke-Pester -Path .\tests\PkceAuth.Tests.ps1 -Output Detailed
 ```
 
 Works in Windows PowerShell 5.1 and PowerShell 7+.
@@ -30,7 +83,10 @@ Works in Windows PowerShell 5.1 and PowerShell 7+.
 - **Grid**: one row per conversation with about 90 standard columns (see the column
   reference below). **Column Selector** picks which standard columns the grid shows and
   adds participant attribute columns (`A:<key>`). Header tooltips explain each column.
-- **Resolve Names**: looks up queue, wrap-up code, division, skill, and language names.
+- **Resolve Names**: looks up queue, wrap-up code, division, skill, and language names, and
+  resolves the agents present in the loaded data in batches of 50 via
+  `GET /api/v2/users?id=...&state=any` (only users who appear in the conversations are
+  fetched; inactive and deleted users still resolve).
   This also runs automatically after a collection when you are authenticated. Any lookup
   that fails (for example, a missing permission) is logged in the Job Monitor and the raw
   ID is shown instead.
@@ -54,7 +110,14 @@ Built from all loaded conversations:
 - **Observations** - rule-based flags. Each one states its reference threshold (for example,
   a 5% abandon rate or 80% within service level); compare them against your own targets.
 - **Breakdowns** - Queues, Agents, Hourly, Daily, Media & Direction, Wrap-up Codes,
-  Disconnects, IVR Flows, Voice Quality, Divisions, Longest, and Lowest MOS.
+  Disconnects, Error Codes, IVR Flows, Voice Quality, Divisions, Longest, Lowest MOS, and
+  Error Conversations.
+- **Error codes** - every segment `errorCode` is listed with who carried the segment, how
+  that leg ended, and a plain-language meaning for known codes (the agent WebRTC drops
+  `...webrtc.endpoint.disconnect.iceIdleDetection` and `...dtlsPeerDisconnect` are called
+  out in the observations). Full list:
+  [help.genesys.cloud/articles/error-codes](https://help.genesys.cloud/articles/error-codes/).
+  The segment filter dimension `errorCode` lets you query only errored conversations.
 - **Export Report (HTML)** - a self-contained HTML file (light/dark aware, printable) plus a
   `.json` file with the same numbers for downstream tools.
 
@@ -132,7 +195,7 @@ are in seconds, and times are local.
 | `WrapUpCode` | Yes | Final wrap-up code (name when resolved). |
 | `WrapUpNote` | No | Final wrap-up note. Redacted in exports. |
 | `DisconnectedBy` | Yes | Participant purpose that ended the conversation (customer, agent, acd, ivr, ...). |
-| `DisconnectType` | No | How it ended: endpoint (hung up), client (agent UI), system, error, timeout, ... |
+| `DisconnectType` | Yes | How it ended: endpoint (hung up), client (agent UI), system, error, timeout, ... |
 | `FlowName` | No | First Architect flow the conversation entered. |
 | `FlowPath` | No | Every flow entered, in order. |
 | `FlowType` | No | Type of the first flow (INBOUNDCALL, INBOUNDCHAT, ...). |
@@ -172,7 +235,9 @@ are in seconds, and times are local.
 | `SurveyScore` | No | Average survey total score. |
 | `NpsScore` | No | Average survey promoter (NPS) score, 0-10. |
 | `Resolutions` | No | Resolution records linked to the conversation. |
-| `ErrorCodes` | No | Segment error codes. |
+| `ErrorCodes` | Yes | Segment error codes (for example `error.ininedgecontrol.connection.webrtc.endpoint.disconnect.iceIdleDetection`). |
+| `ErrorSegments` | No | Number of segments carrying an error code. |
+| `ErrorDisconnect` | No | True when any segment ended with disconnectType error. |
 | `SipCodes` | No | SIP response codes. |
 | `Q850Codes` | No | Q.850 cause codes. |
 | `ParticipantCount` | No | Number of participants. |

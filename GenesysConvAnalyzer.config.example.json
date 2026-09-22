@@ -1,0 +1,7 @@
+{
+  "region": "usw2.pure.cloud",
+  "authMode": "pkce",
+  "clientId": "00000000-0000-0000-0000-000000000000",
+  "redirectUri": "http://localhost:8085/callback/",
+  "scope": ""
+}

@@ -67,11 +67,19 @@
         division, plus longest / lowest-MOS outliers. Export Report writes a
         self-contained HTML file and a JSON copy of the same numbers.
     After collection (when authenticated) queue, wrap-up code, division, skill, and
-    language IDs are resolved to names; failures fall back to IDs and are logged.
+    language IDs are resolved to names, and the agents present in the data are
+    resolved in batches via GET /api/v2/users?id=...; failures fall back to IDs and
+    are logged.
 
 .NOTES
-    Requirements : Windows, PowerShell 5.1+, Genesys Cloud OAuth client credentials
-    Reuses       : Auth + config patterns from GenesysCore-GUI.ps1
+    Requirements : Windows, PowerShell 5.1+, a Genesys Cloud "Code Authorization" OAuth
+                   client (PKCE, no secret) whose redirect URI matches the configured one
+    Auth         : Authorization Code + PKCE via the system browser (src/auth/PkceAuth.ps1).
+                   Client ID / redirect URI come from $script:AuthDefaults below, the
+                   config file next to this script, or GENESYS_* environment variables.
+                   Client-credentials remains available for automation only
+                   (authMode = client_credentials + GENESYS_CLIENT_SECRET env var).
+    Reuses       : Config patterns from GenesysCore-GUI.ps1
 
 .EXAMPLE
     .\GenesysConvAnalyzer.ps1
@@ -96,23 +104,38 @@ Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 
 . (Join-Path $PSScriptRoot 'src/ui/UiApiRetry.ps1')
+. (Join-Path $PSScriptRoot 'src/auth/PkceAuth.ps1')
 . (Join-Path $PSScriptRoot 'src/analysis/ConversationAnalysis.ps1')
 
 # -----------------------------------------------------------------------------
 # Config / Auth  (shared pattern with GenesysCore-GUI.ps1)
 # -----------------------------------------------------------------------------
 
+# In-script authentication defaults. Fill these in once you know the OAuth client for
+# your org, or leave them blank and put the same keys in the config file next to this
+# script (see GenesysConvAnalyzer.config.example.json). Precedence, highest first:
+#   GENESYS_* environment variables > config file > these defaults.
+# None of these values is a secret: PKCE clients are public clients by design.
+$script:AuthDefaults = [ordered]@{
+    authMode    = 'pkce'                              # 'pkce' (browser sign-in) or 'client_credentials' (automation; secret from GENESYS_CLIENT_SECRET)
+    clientId    = ''                                  # "Code Authorization" OAuth client ID from Genesys Cloud Admin > Integrations > OAuth
+    redirectUri = 'http://localhost:8085/callback/'   # must be listed as an Authorized redirect URI on that OAuth client
+    scope       = ''                                  # optional; blank uses the scopes configured on the OAuth client
+}
+$script:PkceLoginTimeoutSeconds = 300
+
 function Resolve-UIConfigPath {
     param([string]$ExplicitPath)
     $candidates = [System.Collections.Generic.List[string]]::new()
     if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) { $candidates.Add($ExplicitPath) | Out-Null }
+    $candidates.Add('GenesysConvAnalyzer.config.json') | Out-Null
     $candidates.Add('GenesysCore-GUI.config.json') | Out-Null
     $candidates.Add('genesys.env.json') | Out-Null
     foreach ($c in @($candidates)) {
         $r = if ([System.IO.Path]::IsPathRooted($c)) { $c } else { Join-Path $PSScriptRoot $c }
         if (Test-Path $r -PathType Leaf) { return (Resolve-Path $r).Path }
     }
-    return (Join-Path $PSScriptRoot 'GenesysCore-GUI.config.json')
+    return (Join-Path $PSScriptRoot 'GenesysConvAnalyzer.config.json')
 }
 
 $script:configPath = Resolve-UIConfigPath -ExplicitPath $ConfigPath
@@ -123,10 +146,42 @@ function Read-GenesysEnvConfig {
 }
 
 function Save-GenesysEnvConfig {
-    param([string]$Region, [string]$ClientId)
-    $cfg = [ordered]@{ region = $Region.Trim() }
+    # Rewrites the config file with the values in use, preserving any other keys it had.
+    param([string]$Region, [string]$ClientId, [string]$RedirectUri, [string]$AuthMode, [string]$Scope)
+    $cfg = [ordered]@{}
+    $existing = Read-GenesysEnvConfig
+    if ($null -ne $existing) {
+        foreach ($p in $existing.PSObject.Properties) { $cfg[$p.Name] = $p.Value }
+    }
+    $cfg['region'] = $Region.Trim()
+    if (-not [string]::IsNullOrWhiteSpace($AuthMode)) { $cfg['authMode'] = $AuthMode.Trim() }
     if (-not [string]::IsNullOrWhiteSpace($ClientId)) { $cfg['clientId'] = $ClientId.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($RedirectUri)) { $cfg['redirectUri'] = $RedirectUri.Trim() }
+    if (-not [string]::IsNullOrWhiteSpace($Scope)) { $cfg['scope'] = $Scope.Trim() }
+    $cfg.Remove('clientSecret') | Out-Null   # never persist a secret, even if an old file had one
     try { ($cfg | ConvertTo-Json -Depth 5) | Set-Content $script:configPath -Encoding utf8 } catch {}
+}
+
+function Get-EffectiveAuthSetting {
+    # Resolves one auth setting: env var > config file > $script:AuthDefaults.
+    param([object]$ConfigObject, [string]$Key, [string[]]$ConfigNames, [string]$EnvName)
+    $envValue = [Environment]::GetEnvironmentVariable($EnvName)
+    if (-not [string]::IsNullOrWhiteSpace($envValue)) { return $envValue.Trim() }
+    $fromConfig = Get-ConfigString -ConfigObject $ConfigObject -PropertyNames $ConfigNames
+    if (-not [string]::IsNullOrWhiteSpace($fromConfig)) { return $fromConfig.Trim() }
+    return [string]$script:AuthDefaults[$Key]
+}
+
+function Get-EffectiveAuthSettings {
+    param([object]$ConfigObject)
+    $mode = (Get-EffectiveAuthSetting -ConfigObject $ConfigObject -Key 'authMode' -ConfigNames @('authMode', 'auth_mode') -EnvName 'GENESYS_AUTH_MODE').ToLowerInvariant()
+    if ($mode -notin @('pkce', 'client_credentials')) { $mode = 'pkce' }
+    return [pscustomobject]@{
+        AuthMode    = $mode
+        ClientId    = Get-EffectiveAuthSetting -ConfigObject $ConfigObject -Key 'clientId' -ConfigNames @('clientId', 'client_id') -EnvName 'GENESYS_CLIENT_ID'
+        RedirectUri = Get-EffectiveAuthSetting -ConfigObject $ConfigObject -Key 'redirectUri' -ConfigNames @('redirectUri', 'redirect_uri') -EnvName 'GENESYS_REDIRECT_URI'
+        Scope       = Get-EffectiveAuthSetting -ConfigObject $ConfigObject -Key 'scope' -ConfigNames @('scope') -EnvName 'GENESYS_SCOPE'
+    }
 }
 
 function Get-ConfigString {
@@ -146,6 +201,8 @@ function Get-ConfigString {
 # -----------------------------------------------------------------------------
 
 $script:accessToken = $null
+$script:tokenRecord = $null      # AccessToken/RefreshToken/ExpiresAt/Region/ClientId from PkceAuth.ps1
+$script:authSettings = $null     # resolved at startup by Get-EffectiveAuthSettings
 $script:headers = @{}
 $script:baseUri = "https://api.$DefaultRegion"
 $script:gcApiRetrySettings = Resolve-UiApiRetrySettings
@@ -170,10 +227,11 @@ $script:profileCache = @{}           # conversationId -> profile (IDs only; vali
 $script:gridRowCache = $null         # flat rows for the grid, rebuilt when attributes or names change
 $script:gridRowCacheKey = ''
 $script:currentReport = $null        # collection report, rebuilt when data or names change
-$script:lookups = New-ConversationLookupTable   # id -> name for queues, wrap-up codes, divisions, skills, languages
-$script:lookupsLoaded = $false
+$script:lookups = New-ConversationLookupTable   # id -> name for queues, wrap-up codes, divisions, skills, languages, users
+$script:lookupsLoaded = $false       # org-wide reference types loaded (users are incremental per data set)
 $script:lookupVersion = 0            # bumped on every lookup refresh to invalidate cached rows
 $script:maxLookupPages = 100         # 100 pages x 100 entities per reference type
+$script:userLookupBatchSize = 50     # user IDs per GET /api/v2/users?id=... call (API caps the list at pageSize, max 100)
 $script:dataSource = ''              # shown in the report header ("Analytics job <id>" or "File <name>")
 $script:dataQueryInterval = ''
 $script:currentJobInterval = ''
@@ -532,9 +590,9 @@ function Read-ConversationsFromFile {
         </ComboBox>
         <Label   Grid.Column="2" Content="Client ID:"/>
         <TextBox Grid.Column="3" Name="ClientIdBox"/>
-        <Label   Grid.Column="4" Content="Secret:"/>
-        <PasswordBox Grid.Column="5" Name="ClientSecretBox" VerticalAlignment="Center" Margin="2"/>
-        <Button  Grid.Column="6" Name="AuthButton" Content="Authenticate" Margin="6,2,2,2"/>
+        <Label   Grid.Column="4" Content="Redirect:"/>
+        <TextBox Grid.Column="5" Name="RedirectUriBox" ToolTip="Redirect URI registered on the Code Authorization (PKCE) OAuth client, e.g. http://localhost:8085/callback/"/>
+        <Button  Grid.Column="6" Name="AuthButton" Content="Sign in" Margin="6,2,2,2" ToolTip="Opens your browser for Genesys Cloud sign-in (PKCE). No client secret needed."/>
         <TextBlock Grid.Column="7" Name="AuthStatusLabel" VerticalAlignment="Center" Margin="6,0,0,0" FontWeight="Bold"/>
       </Grid>
     </GroupBox>
@@ -891,7 +949,7 @@ function Get-ComboValue {
 
 $regionComboBox = Get-Control 'RegionComboBox'
 $clientIdBox = Get-Control 'ClientIdBox'
-$clientSecretBox = Get-Control 'ClientSecretBox'
+$redirectUriBox = Get-Control 'RedirectUriBox'
 $authButton = Get-Control 'AuthButton'
 $authStatusLabel = Get-Control 'AuthStatusLabel'
 
@@ -1002,7 +1060,7 @@ function New-FilterRow {
         @('mediaType', 'originatingDirection', 'queueId', 'userId', 'conversationId', 'divisionId', 'flowId', 'isEnded', 'flaggedReason')
     }
     else {
-        @('purpose', 'segmentType', 'queueId', 'userId', 'flowId', 'disconnectType', 'edgeId')
+        @('purpose', 'segmentType', 'queueId', 'userId', 'flowId', 'disconnectType', 'errorCode', 'edgeId')
     }
 
     $border = New-Object System.Windows.Controls.Border
@@ -1605,14 +1663,36 @@ function Export-ReportFile {
 function Update-ReferenceLookups {
     # Loads id -> name maps for the reference data that analytics records only carry as IDs.
     # Each type fails independently (e.g. missing permission) and falls back to raw IDs.
+    # Org-wide types load once per session; users are resolved incrementally from the loaded
+    # conversations on every call (see Update-UserLookups), so a new data set gets its agents named.
     param([switch]$Force)
 
     if ([string]::IsNullOrWhiteSpace($script:accessToken)) {
         Append-JobLog 'Name lookup skipped: not authenticated. IDs are shown instead of names.'
         return $false
     }
-    if ($script:lookupsLoaded -and -not $Force) { return $true }
 
+    $loadedAny = $false
+    $changed = $false
+    if ($Force -or -not $script:lookupsLoaded) {
+        $loadedAny = Update-OrgReferenceLookups
+        $changed = $true
+    }
+
+    $userResult = Update-UserLookups -Force:$Force
+    if ($userResult.Loaded) { $loadedAny = $true }
+    if ($userResult.Changed) { $changed = $true }
+
+    if ($changed) {
+        $script:lookupVersion++
+        Reset-AnalysisCaches
+        Set-Status 'Name lookup complete.'
+    }
+    return $loadedAny
+}
+
+function Update-OrgReferenceLookups {
+    # Pages through each org-wide reference type. Returns $true when at least one type loaded.
     $sources = @(
         @{ Kind = 'queues'; Label = 'queues'; Path = '/api/v2/routing/queues' }
         @{ Kind = 'wrapupCodes'; Label = 'wrap-up codes'; Path = '/api/v2/routing/wrapupcodes' }
@@ -1649,10 +1729,55 @@ function Update-ReferenceLookups {
 
     # Marked loaded even on partial failure so every collect does not retry; Resolve Names forces a retry.
     $script:lookupsLoaded = $true
-    $script:lookupVersion++
-    Reset-AnalysisCaches
-    Set-Status 'Name lookup complete.'
     return $loadedAny
+}
+
+function Update-UserLookups {
+    # Resolves the agents that appear in the loaded conversations through GET /api/v2/users?id=a,b,c
+    # in batches, so only people present in the data are fetched (an org-wide user list can be huge).
+    # Incremental: IDs already in the map are skipped unless -Force. state=any keeps inactive and
+    # deleted users resolvable, since they can still own conversations in the query window.
+    param([switch]$Force)
+
+    $result = [pscustomobject]@{ Loaded = $false; Changed = $false; Requested = 0; Resolved = 0 }
+    if ([string]::IsNullOrWhiteSpace($script:accessToken) -or $script:allConversations.Count -eq 0) { return $result }
+
+    $userMap = $script:lookups['users']
+    if ($null -eq $userMap) { $userMap = @{}; $script:lookups['users'] = $userMap }
+    $allIds = @(Get-ConversationUserIds -Conversations $script:allConversations.ToArray())
+    $pending = if ($Force) { $allIds } else { @($allIds | Where-Object { -not $userMap.ContainsKey($_) }) }
+    if ($pending.Count -eq 0) { return $result }
+    $result.Requested = $pending.Count
+
+    $batchSize = [Math]::Max(1, [int]$script:userLookupBatchSize)
+    $batchCount = [int][Math]::Ceiling($pending.Count / $batchSize)
+    $batchNumber = 0
+    for ($start = 0; $start -lt $pending.Count; $start += $batchSize) {
+        $batchNumber++
+        $end = [Math]::Min($start + $batchSize, $pending.Count) - 1
+        $batch = @($pending[$start..$end])
+        Set-Status "Resolving names: users (batch $batchNumber of $batchCount)..."
+        [System.Windows.Forms.Application]::DoEvents()
+        try {
+            $response = Invoke-GcApiRequest -Method 'GET' -Path '/api/v2/users' -QueryParams @{ id = ($batch -join ','); state = 'any'; pageSize = [string]$batch.Count }
+            foreach ($entity in @($response.entities)) {
+                if ($null -eq $entity) { continue }
+                $id = [string]$entity.id
+                $name = [string]$entity.name
+                if ([string]::IsNullOrWhiteSpace($id) -or [string]::IsNullOrWhiteSpace($name)) { continue }
+                $userMap[$id] = $name
+                $result.Resolved++
+            }
+            $result.Loaded = $true
+            $result.Changed = $true
+        }
+        catch {
+            $failureText = Format-UiApiFailure -Exception $_.Exception
+            Append-JobLog "Name lookup for users (batch $batchNumber of $batchCount) failed; IDs will be shown instead. $failureText"
+        }
+    }
+    Append-JobLog "Name lookup: resolved $($result.Resolved) of $($result.Requested) users."
+    return $result
 }
 
 # -----------------------------------------------------------------------------
@@ -1755,28 +1880,77 @@ $authButton.Add_Click({
             return
         }
 
-        $script:baseUri = "https://api.$region"
+        $clientId = ([string]$clientIdBox.Text).Trim()
+        $redirectUri = ([string]$redirectUriBox.Text).Trim()
+        $authMode = $script:authSettings.AuthMode
 
-        $clientId = [string]$clientIdBox.Text
-        $clientSecret = [string]$clientSecretBox.Password
-
-        if ([string]::IsNullOrWhiteSpace($clientId) -or [string]::IsNullOrWhiteSpace($clientSecret)) {
-            [System.Windows.MessageBox]::Show('Enter Client ID and Secret.', 'Authentication', 'OK', 'Warning') | Out-Null
+        if ([string]::IsNullOrWhiteSpace($clientId)) {
+            [System.Windows.MessageBox]::Show(
+                "Enter the OAuth Client ID.`n`nSet it once in `$script:AuthDefaults at the top of GenesysConvAnalyzer.ps1, in $($script:configPath), or via the GENESYS_CLIENT_ID environment variable.",
+                'Authentication', 'OK', 'Warning') | Out-Null
+            return
+        }
+        if ($authMode -eq 'pkce' -and -not (Test-PkceRedirectUri -RedirectUri $redirectUri)) {
+            [System.Windows.MessageBox]::Show(
+                "Enter a valid Redirect URI (for example http://localhost:8085/callback/).`nIt must match an Authorized redirect URI on the OAuth client.",
+                'Authentication', 'OK', 'Warning') | Out-Null
             return
         }
 
+        $script:baseUri = "https://api.$region"
         $authButton.IsEnabled = $false
         Set-Status 'Authenticating...'
         $authStatusLabel.Text = 'Authenticating...'
         $authStatusLabel.Foreground = [System.Windows.Media.Brushes]::DarkOrange
 
         try {
-            $pair = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("${clientId}:${clientSecret}"))
-            $authResult = Invoke-RestMethod -Uri "https://login.$region/oauth/token" -Method POST `
-                -Headers @{ Authorization = "Basic $pair" } `
-                -Body @{ grant_type = 'client_credentials' } -ErrorAction Stop
+            $tokenRecord = $null
+            if ($authMode -eq 'client_credentials') {
+                $clientSecret = [string]$env:GENESYS_CLIENT_SECRET
+                if ([string]::IsNullOrWhiteSpace($clientSecret)) {
+                    throw 'authMode is client_credentials but the GENESYS_CLIENT_SECRET environment variable is not set. Use PKCE (authMode = pkce) for interactive sign-in.'
+                }
+                $pair = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("${clientId}:${clientSecret}"))
+                $authResult = Invoke-RestMethod -Uri "https://login.$region/oauth/token" -Method POST `
+                    -Headers @{ Authorization = "Basic $pair" } `
+                    -Body @{ grant_type = 'client_credentials' } -ErrorAction Stop
+                $tokenRecord = ConvertTo-PkceTokenRecord -TokenResponse $authResult -Region $region -ClientId $clientId
+            }
+            else {
+                # Silent refresh first when we still hold a refresh token for this client/region.
+                $prior = $script:tokenRecord
+                if ($null -ne $prior -and -not [string]::IsNullOrWhiteSpace($prior.RefreshToken) -and $prior.Region -eq $region -and $prior.ClientId -eq $clientId) {
+                    try {
+                        $tokenRecord = Invoke-PkceTokenRefresh -Region $region -ClientId $clientId -RefreshToken $prior.RefreshToken
+                        Append-JobLog 'Token refreshed silently.'
+                    }
+                    catch {
+                        Append-JobLog "Silent refresh failed ($($_.Exception.Message)); starting browser sign-in."
+                        $tokenRecord = $null
+                    }
+                }
 
-            $script:accessToken = $authResult.access_token
+                if ($null -eq $tokenRecord) {
+                    Set-Status 'Waiting for browser sign-in...'
+                    $authStatusLabel.Text = 'Waiting for browser...'
+                    $tokenRecord = Invoke-PkceLogin -Region $region -ClientId $clientId -RedirectUri $redirectUri `
+                        -Scope $script:authSettings.Scope -TimeoutSeconds $script:PkceLoginTimeoutSeconds `
+                        -Log { param($m) Append-JobLog $m } `
+                        -PumpAction { [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::Background) } `
+                        -CancelCheck { -not $window.IsLoaded } `
+                        -ManualCodePrompt {
+                            param($authorizeUrl)
+                            # Listener could not bind (port busy): let the user paste the redirect URL from the browser.
+                            Add-Type -AssemblyName Microsoft.VisualBasic
+                            [Microsoft.VisualBasic.Interaction]::InputBox(
+                                "The local callback listener could not start, so the code cannot be captured automatically.`n`nSign in in the browser, then paste the full URL of the page it lands on (it contains ?code=...).",
+                                'Paste redirect URL', '')
+                        }
+                }
+            }
+
+            $script:tokenRecord = $tokenRecord
+            $script:accessToken = $tokenRecord.AccessToken
             $script:headers = @{ Authorization = "Bearer $($script:accessToken)" }
 
             # A new token may belong to a different org or region: drop cached names.
@@ -1785,17 +1959,21 @@ $authButton.Add_Click({
             $script:lookupVersion++
             Reset-AnalysisCaches
 
-            $authStatusLabel.Text = 'Authenticated'
+            $expiryNote = if ($null -ne $tokenRecord.ExpiresAt) { " (expires $($tokenRecord.ExpiresAt.ToString('HH:mm')))" } else { '' }
+            $authStatusLabel.Text = "Authenticated$expiryNote"
             $authStatusLabel.Foreground = [System.Windows.Media.Brushes]::DarkGreen
-            Save-GenesysEnvConfig -Region $region -ClientId $clientId
-            Set-Status "Authenticated - $region."
-            Append-JobLog "Authenticated to $region."
+            Save-GenesysEnvConfig -Region $region -ClientId $clientId -RedirectUri $redirectUri -AuthMode $authMode -Scope $script:authSettings.Scope
+            Set-Status "Authenticated - $region$expiryNote."
+            Append-JobLog "Authenticated to $region via $authMode$expiryNote."
         }
         catch {
             $authStatusLabel.Text = 'Failed'
             $authStatusLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
             Set-Status "Authentication failed."
-            [System.Windows.MessageBox]::Show("Authentication failed:`n$($_.Exception.Message)", 'Auth Error', 'OK', 'Error') | Out-Null
+            Append-JobLog "Authentication failed: $($_.Exception.Message)"
+            if ($window.IsLoaded) {
+                [System.Windows.MessageBox]::Show("Authentication failed:`n$($_.Exception.Message)", 'Auth Error', 'OK', 'Error') | Out-Null
+            }
         }
         finally {
             $authButton.IsEnabled = $true
@@ -2051,7 +2229,7 @@ $collectResultsBtn.Add_Click({
 
             $script:dataSource = "Analytics job $($script:currentJobId)"
             $script:dataQueryInterval = $script:currentJobInterval
-            if (-not $script:lookupsLoaded) { Update-ReferenceLookups | Out-Null }
+            Update-ReferenceLookups | Out-Null
             Show-Results
             $mainTabControl.SelectedIndex = 2
         }
@@ -2313,7 +2491,7 @@ $loadJsonlBtn.Add_Click({
 
             $script:dataSource = "File $([System.IO.Path]::GetFileName($dlg.FileName))"
             $script:dataQueryInterval = ''
-            if (-not $script:lookupsLoaded -and -not [string]::IsNullOrWhiteSpace($script:accessToken)) { Update-ReferenceLookups | Out-Null }
+            if (-not [string]::IsNullOrWhiteSpace($script:accessToken)) { Update-ReferenceLookups | Out-Null }
             Show-Results
             $mainTabControl.SelectedIndex = 2
 
@@ -2385,17 +2563,28 @@ $cfg = Read-GenesysEnvConfig
 if ($null -ne $cfg) {
     $cfgRegion = Get-ConfigString -ConfigObject $cfg -PropertyNames @('region')
     if (-not [string]::IsNullOrWhiteSpace($cfgRegion)) { $regionComboBox.Text = $cfgRegion }
-
-    $cfgClientId = Get-ConfigString -ConfigObject $cfg -PropertyNames @('clientId', 'client_id')
-    if (-not [string]::IsNullOrWhiteSpace($cfgClientId)) { $clientIdBox.Text = $cfgClientId }
 }
+if (-not [string]::IsNullOrWhiteSpace($env:GENESYS_REGION)) { $regionComboBox.Text = $env:GENESYS_REGION }
 
-# Env vars override config
-if (-not [string]::IsNullOrWhiteSpace($env:GENESYS_CLIENT_ID)) { $clientIdBox.Text = $env:GENESYS_CLIENT_ID }
-if (-not [string]::IsNullOrWhiteSpace($env:GENESYS_CLIENT_SECRET)) { $clientSecretBox.Password = $env:GENESYS_CLIENT_SECRET }
-
-if (-not [string]::IsNullOrWhiteSpace([string]$clientIdBox.Text) -and -not [string]::IsNullOrWhiteSpace([string]$clientSecretBox.Password)) {
-    $authButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+# Auth settings: env vars > config file > $script:AuthDefaults
+$script:authSettings = Get-EffectiveAuthSettings -ConfigObject $cfg
+$clientIdBox.Text = $script:authSettings.ClientId
+$redirectUriBox.Text = $script:authSettings.RedirectUri
+if ($script:authSettings.AuthMode -eq 'client_credentials') {
+    $redirectUriBox.IsEnabled = $false
+    $redirectUriBox.ToolTip = 'Not used: authMode is client_credentials (secret from GENESYS_CLIENT_SECRET).'
+    $authButton.Content = 'Authenticate'
+    # Automation mode: sign in immediately when the secret is available.
+    if (-not [string]::IsNullOrWhiteSpace($script:authSettings.ClientId) -and -not [string]::IsNullOrWhiteSpace($env:GENESYS_CLIENT_SECRET)) {
+        $authButton.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+    }
+}
+else {
+    $authStatusLabel.Text = 'Not signed in'
+    $authStatusLabel.Foreground = [System.Windows.Media.Brushes]::Gray
+    if ([string]::IsNullOrWhiteSpace($script:authSettings.ClientId)) {
+        Append-JobLog "No PKCE Client ID configured. Set clientId in $($script:configPath) (see GenesysConvAnalyzer.config.example.json) or in `$script:AuthDefaults."
+    }
 }
 
 # -----------------------------------------------------------------------------
