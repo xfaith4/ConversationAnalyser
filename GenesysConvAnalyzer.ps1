@@ -71,6 +71,17 @@
     resolved in batches via GET /api/v2/users?id=...; failures fall back to IDs and
     are logged.
 
+    Campaign Analysis
+    -----------------
+    src/campaign/CampaignAnalysis.ps1 backs the Campaign Analysis tab. Every campaign in
+    the org is listed from GET /api/v2/outbound/campaigns/all and can be searched. For the
+    selected campaign the tab shows configuration, progress, diagnostics, live stats, and
+    the diagnostics summary (each source fails independently and is logged), the campaign
+    rules that watch or act on it (all rules are read once and matched by campaign ID),
+    and the newest outbound events that mention it (org-wide event log, filtered by ID).
+    "Analyze Conversations" pre-fills the Query Builder with an outboundCampaignId segment
+    filter and a date window so the normal job / results / report flow applies.
+
 .NOTES
     Requirements : Windows, PowerShell 5.1+, a Genesys Cloud "Code Authorization" OAuth
                    client (PKCE, no secret) whose redirect URI matches the configured one
@@ -106,6 +117,7 @@ Add-Type -AssemblyName System.Windows.Forms
 . (Join-Path $PSScriptRoot 'src/ui/UiApiRetry.ps1')
 . (Join-Path $PSScriptRoot 'src/auth/PkceAuth.ps1')
 . (Join-Path $PSScriptRoot 'src/analysis/ConversationAnalysis.ps1')
+. (Join-Path $PSScriptRoot 'src/campaign/CampaignAnalysis.ps1')
 
 # -----------------------------------------------------------------------------
 # Config / Auth  (shared pattern with GenesysCore-GUI.ps1)
@@ -246,6 +258,13 @@ $script:maxPageCount = 500    # Stop paging after this many pages (500k conversa
 $script:seenCursors = $null  # HashSet populated during collection to detect cursor loops
 $script:convFilterRows = [System.Collections.Generic.List[pscustomobject]]::new()
 $script:segFilterRows = [System.Collections.Generic.List[pscustomobject]]::new()
+
+# -- Campaign Analysis tab (see src/campaign/CampaignAnalysis.ps1) -------------
+$script:campaignRows = @()             # every campaign row from GET /api/v2/outbound/campaigns/all
+$script:selectedCampaign = $null       # row selected in the campaign grid
+$script:campaignSnapshot = $null       # last status snapshot for the selected campaign
+$script:campaignGridRebinding = $false # suppresses selection-changed work while the grid is re-bound
+$script:campaignEventPages = 5         # newest pages (x100 events) of the org-wide event log to scan
 
 # -----------------------------------------------------------------------------
 # API helpers
@@ -917,6 +936,104 @@ function Read-ConversationsFromFile {
           <TabControl Grid.Row="3" Name="ReportTablesTab" Margin="0,6,0,0"/>
         </Grid>
       </TabItem>
+
+      <!-- == Tab 5: Campaign Analysis == -->
+      <TabItem Header=" Campaign Analysis " Name="CampaignTab">
+        <Grid Margin="6">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="420" MinWidth="260"/>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="*" MinWidth="320"/>
+          </Grid.ColumnDefinitions>
+
+          <!-- Campaign picker -->
+          <Grid Grid.Column="0">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+            <DockPanel Grid.Row="0" LastChildFill="True">
+              <Button DockPanel.Dock="Left" Name="LoadCampaignsBtn" Content="Load Campaigns" FontWeight="Bold"
+                      ToolTip="Reads every voice, SMS, and email campaign in the org (GET /api/v2/outbound/campaigns/all). Needs authentication."/>
+              <TextBox Name="CampaignSearchBox"
+                       ToolTip="Filter by name, ID, status, media type, or division. Several words must all match."/>
+            </DockPanel>
+            <TextBlock Grid.Row="1" Name="CampaignListStatusText" Foreground="Gray" TextWrapping="Wrap" Margin="2,2,2,4"
+                       Text="Authenticate, then click Load Campaigns. Type in the box to filter the list."/>
+            <DataGrid Grid.Row="2" Name="CampaignGrid"
+                      IsReadOnly="True" AutoGenerateColumns="False"
+                      SelectionMode="Single" CanUserSortColumns="True"
+                      GridLinesVisibility="Horizontal" AlternatingRowBackground="#F9F9F9"
+                      EnableRowVirtualization="True"/>
+          </Grid>
+
+          <GridSplitter Grid.Column="1" Width="6" HorizontalAlignment="Center" VerticalAlignment="Stretch"
+                        Background="#E0E0E0" ToolTip="Drag to resize the campaign list"/>
+
+          <!-- Selected campaign -->
+          <Grid Grid.Column="2" Margin="6,0,0,0">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="Auto"/>
+              <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+            <Border Grid.Row="0" Background="#EBF5FB" BorderBrush="#2980B9" BorderThickness="1" Padding="6,4">
+              <StackPanel>
+                <TextBlock Name="CampaignHeadlineText" FontWeight="Bold" FontSize="13" TextWrapping="Wrap" Text="No campaign selected."/>
+                <TextBlock Name="CampaignScopeText" Foreground="Gray" TextWrapping="Wrap" Margin="0,2,0,0"
+                           Text="Select a campaign on the left, then refresh its status, list its rules, view recent events, or analyze its conversations."/>
+              </StackPanel>
+            </Border>
+            <WrapPanel Grid.Row="1" Margin="0,4,0,4">
+              <Button Name="CampaignStatusBtn" Content="Refresh Status" FontWeight="Bold" IsEnabled="False"
+                      ToolTip="Configuration, progress, diagnostics, live stats, and diagnostics summary for the selected campaign. Each source is fetched independently."/>
+              <Button Name="CampaignRulesBtn" Content="Rules" IsEnabled="False"
+                      ToolTip="Campaign rules that watch this campaign or act on it. All rules are read and matched by campaign ID."/>
+              <Button Name="CampaignEventsBtn" Content="Recent Events" IsEnabled="False"
+                      ToolTip="Newest outbound events that mention this campaign (org-wide event log, filtered by campaign ID)."/>
+              <Button Name="AnalyzeCampaignBtn" Content="Analyze Conversations" FontWeight="Bold" IsEnabled="False"
+                      Background="#005A9C" Foreground="White"
+                      ToolTip="Pre-fills the Query Builder with an outboundCampaignId segment filter and a date window. Review and submit the job there."/>
+              <Button Name="CopyCampaignIdBtn" Content="Copy ID" IsEnabled="False" ToolTip="Copy the campaign ID to the clipboard."/>
+            </WrapPanel>
+            <TabControl Grid.Row="2" Name="CampaignDetailTabs">
+              <TabItem Header="Status">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                  <StackPanel Name="CampaignStatusPanel" Margin="4"/>
+                </ScrollViewer>
+              </TabItem>
+              <TabItem Header="Rules">
+                <Grid>
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                  </Grid.RowDefinitions>
+                  <TextBlock Grid.Row="0" Name="CampaignRulesStatusText" Foreground="Gray" TextWrapping="Wrap" Margin="2" Text="Click Rules to load."/>
+                  <DataGrid Grid.Row="1" Name="CampaignRulesGrid" IsReadOnly="True" AutoGenerateColumns="False"
+                            GridLinesVisibility="Horizontal" AlternatingRowBackground="#FAFAFA"/>
+                </Grid>
+              </TabItem>
+              <TabItem Header="Events">
+                <Grid>
+                  <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                  </Grid.RowDefinitions>
+                  <TextBlock Grid.Row="0" Name="CampaignEventsStatusText" Foreground="Gray" TextWrapping="Wrap" Margin="2" Text="Click Recent Events to load."/>
+                  <DataGrid Grid.Row="1" Name="CampaignEventsGrid" IsReadOnly="True" AutoGenerateColumns="False"
+                            GridLinesVisibility="Horizontal" AlternatingRowBackground="#FAFAFA"/>
+                </Grid>
+              </TabItem>
+              <TabItem Header="Raw JSON">
+                <TextBox Name="CampaignRawJsonBox" IsReadOnly="True" TextWrapping="NoWrap"
+                         HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"
+                         FontFamily="Consolas" FontSize="10" Background="#1E1E1E" Foreground="#D4D4D4"/>
+              </TabItem>
+            </TabControl>
+          </Grid>
+        </Grid>
+      </TabItem>
     </TabControl>
 
     <!-- Status bar -->
@@ -1010,6 +1127,25 @@ $statusText = Get-Control 'StatusText'
 
 $detailTabControl = Get-Control 'DetailTabControl'
 
+$loadCampaignsBtn = Get-Control 'LoadCampaignsBtn'
+$campaignSearchBox = Get-Control 'CampaignSearchBox'
+$campaignListStatusText = Get-Control 'CampaignListStatusText'
+$campaignGrid = Get-Control 'CampaignGrid'
+$campaignHeadlineText = Get-Control 'CampaignHeadlineText'
+$campaignScopeText = Get-Control 'CampaignScopeText'
+$campaignStatusBtn = Get-Control 'CampaignStatusBtn'
+$campaignRulesBtn = Get-Control 'CampaignRulesBtn'
+$campaignEventsBtn = Get-Control 'CampaignEventsBtn'
+$analyzeCampaignBtn = Get-Control 'AnalyzeCampaignBtn'
+$copyCampaignIdBtn = Get-Control 'CopyCampaignIdBtn'
+$campaignDetailTabs = Get-Control 'CampaignDetailTabs'
+$campaignStatusPanel = Get-Control 'CampaignStatusPanel'
+$campaignRulesStatusText = Get-Control 'CampaignRulesStatusText'
+$campaignRulesGrid = Get-Control 'CampaignRulesGrid'
+$campaignEventsStatusText = Get-Control 'CampaignEventsStatusText'
+$campaignEventsGrid = Get-Control 'CampaignEventsGrid'
+$campaignRawJsonBox = Get-Control 'CampaignRawJsonBox'
+
 $script:exportRedactionMode = [bool]$redactExportsCheckBox.IsChecked
 $redactExportsCheckBox.Add_Checked({ $script:exportRedactionMode = $true })
 $redactExportsCheckBox.Add_Unchecked({ $script:exportRedactionMode = $false })
@@ -1060,7 +1196,7 @@ function New-FilterRow {
         @('mediaType', 'originatingDirection', 'queueId', 'userId', 'conversationId', 'divisionId', 'flowId', 'isEnded', 'flaggedReason')
     }
     else {
-        @('purpose', 'segmentType', 'queueId', 'userId', 'flowId', 'disconnectType', 'errorCode', 'edgeId')
+        @('purpose', 'segmentType', 'queueId', 'userId', 'flowId', 'disconnectType', 'errorCode', 'edgeId', 'outboundCampaignId', 'outboundContactId', 'outboundContactListId')
     }
 
     $border = New-Object System.Windows.Controls.Border
@@ -2548,6 +2684,251 @@ $refreshReportBtn.Add_Click({
     })
 
 $exportReportBtn.Add_Click({ Export-ReportFile })
+
+# -----------------------------------------------------------------------------
+# Campaign Analysis tab  (API + shaping logic: src/campaign/CampaignAnalysis.ps1)
+# -----------------------------------------------------------------------------
+
+# Request adapter handed to the campaign module: same auth, retry, and logging as every other call.
+$script:campaignRequest = {
+    param([string]$Method, [string]$Path, [hashtable]$QueryParams)
+    Invoke-GcApiRequest -Method $Method -Path $Path -QueryParams $QueryParams
+}
+
+$script:campaignGridColumns = @('Name', 'MediaType', 'Status', 'Division', 'Modified')
+$script:campaignGridHeaders = @{ MediaType = 'Media' }
+$script:campaignRuleColumns = @('Name', 'Enabled', 'Role', 'Conditions', 'Actions', 'Modified', 'RuleId')
+$script:campaignEventColumns = @('Timestamp', 'Level', 'Category', 'Code', 'Message', 'CorrelationId')
+$script:campaignBusyName = ''   # name of the campaign being fetched, for progress messages
+
+function Test-CampaignAuthenticated {
+    param([string]$Title = 'Campaign Analysis')
+    if ([string]::IsNullOrWhiteSpace($script:accessToken)) {
+        [System.Windows.MessageBox]::Show('Authenticate first - campaigns are read from your Genesys Cloud org.', $Title, 'OK', 'Information') | Out-Null
+        return $false
+    }
+    return $true
+}
+
+function Invoke-CampaignUiPump { [System.Windows.Forms.Application]::DoEvents() }
+
+function Set-CampaignButtonsEnabled {
+    param([bool]$Enabled)
+    foreach ($b in @($campaignStatusBtn, $campaignRulesBtn, $campaignEventsBtn, $analyzeCampaignBtn, $copyCampaignIdBtn)) { $b.IsEnabled = $Enabled }
+}
+
+function Clear-CampaignDetailPanels {
+    $campaignStatusPanel.Children.Clear()
+    Set-GridRows -Grid $campaignRulesGrid -Rows @()
+    Set-GridRows -Grid $campaignEventsGrid -Rows @()
+    $campaignRulesStatusText.Text = 'Click Rules to load.'
+    $campaignEventsStatusText.Text = 'Click Recent Events to load.'
+    $campaignRawJsonBox.Text = ''
+    $script:campaignSnapshot = $null
+}
+
+function Show-CampaignSelection {
+    $c = $script:selectedCampaign
+    Clear-CampaignDetailPanels
+    if ($null -eq $c) {
+        $campaignHeadlineText.Text = 'No campaign selected.'
+        $campaignScopeText.Text = 'Select a campaign on the left, then refresh its status, list its rules, view recent events, or analyze its conversations.'
+        Set-CampaignButtonsEnabled $false
+        return
+    }
+    $campaignHeadlineText.Text = "$($c.Name)   [$($c.MediaType)]   status: $($c.Status)"
+    $campaignScopeText.Text = "ID $($c.CampaignId)  |  division: $($c.Division)  |  created $($c.Created)  |  modified $($c.Modified)"
+    Set-CampaignButtonsEnabled $true
+}
+
+function Update-CampaignGrid {
+    # Re-binds the grid to the rows matching the search box, keeping the current selection when it is still visible.
+    $rows = @(Select-CampaignRows -Rows $script:campaignRows -Text $campaignSearchBox.Text)
+    $previous = $script:selectedCampaign
+    $script:campaignGridRebinding = $true
+    try {
+        Set-GridRows -Grid $campaignGrid -Rows $rows -Columns $script:campaignGridColumns -HeaderMap $script:campaignGridHeaders
+        $match = $null
+        if ($null -ne $previous) { $match = $rows | Where-Object { $_.CampaignId -eq $previous.CampaignId } | Select-Object -First 1 }
+        if ($null -ne $match) { $campaignGrid.SelectedItem = $match; $script:selectedCampaign = $match }
+    }
+    finally { $script:campaignGridRebinding = $false }
+    if ($null -ne $previous -and $null -eq $match) { $script:selectedCampaign = $null; Show-CampaignSelection }
+    $total = @($script:campaignRows).Count
+    $campaignListStatusText.Text = if ($total -eq 0) { 'No campaigns loaded.' }
+    elseif ($rows.Count -eq $total) { "$total campaign(s). Type to filter." }
+    else { "$($rows.Count) of $total campaign(s) match." }
+}
+
+function Add-CampaignNote {
+    param([System.Windows.Controls.Panel]$Panel, [string]$Text, [System.Windows.Media.Brush]$Foreground = [System.Windows.Media.Brushes]::Gray)
+    $tb = New-Object System.Windows.Controls.TextBlock
+    $tb.Text = $Text; $tb.TextWrapping = 'Wrap'; $tb.Foreground = $Foreground
+    $tb.Margin = [System.Windows.Thickness]::new(4, 2, 4, 2)
+    $Panel.Children.Add($tb) | Out-Null
+}
+
+function Add-CampaignTileGroup {
+    param([System.Windows.Controls.Panel]$Panel, [string]$Title, [AllowNull()][object[]]$Tiles)
+    if ($null -eq $Tiles -or $Tiles.Count -eq 0) { return }
+    $header = New-Object System.Windows.Controls.TextBlock
+    $header.Text = $Title; $header.FontWeight = [System.Windows.FontWeights]::Bold
+    $header.Margin = [System.Windows.Thickness]::new(4, 8, 4, 2)
+    $Panel.Children.Add($header) | Out-Null
+    $wrap = New-Object System.Windows.Controls.WrapPanel
+    foreach ($t in $Tiles) { $wrap.Children.Add((New-InfoTile -Label $t.Label -Value $t.Value -Caption $t.Caption -MinWidth 150)) | Out-Null }
+    $Panel.Children.Add($wrap) | Out-Null
+}
+
+function Show-CampaignStatus {
+    param([object]$Snapshot)
+    $campaignStatusPanel.Children.Clear()
+    Add-CampaignNote -Panel $campaignStatusPanel -Text ('Fetched {0}  |  sources: {1}' -f $Snapshot.FetchedAt.ToString('yyyy-MM-dd HH:mm:ss'), (@($Snapshot.Sources) -join ', '))
+    foreach ($e in @($Snapshot.Errors)) { Add-CampaignNote -Panel $campaignStatusPanel -Text "Not available: $e" -Foreground ([System.Windows.Media.Brushes]::DarkRed) }
+    $config = @(ConvertTo-CampaignConfigTiles -Detail $Snapshot.Detail -MediaKind $Snapshot.MediaKind)
+    Add-CampaignTileGroup -Panel $campaignStatusPanel -Title 'Configuration' -Tiles $config
+    $status = @(ConvertTo-CampaignStatusTiles -Snapshot $Snapshot)
+    foreach ($group in @($status | ForEach-Object { $_.Group } | Select-Object -Unique)) {
+        Add-CampaignTileGroup -Panel $campaignStatusPanel -Title $group -Tiles @($status | Where-Object { $_.Group -eq $group })
+    }
+    if ($config.Count -eq 0 -and $status.Count -eq 0) { Add-CampaignNote -Panel $campaignStatusPanel -Text 'No status data was returned. See the Job Monitor activity log for the API errors.' }
+    $campaignRawJsonBox.Text = ($Snapshot | Select-Object CampaignId, MediaKind, FetchedAt, Sources, Errors, Detail, Progress, Stats, Diagnostics, Summary | ConvertTo-Json -Depth 20)
+}
+
+$loadCampaignsBtn.Add_Click({
+        if (-not (Test-CampaignAuthenticated -Title 'Load Campaigns')) { return }
+        $loadCampaignsBtn.IsEnabled = $false
+        try {
+            Set-Status 'Loading campaigns...'
+            $result = Get-OutboundCampaignList -Request $script:campaignRequest -OnProgress { param($n) Set-Status "Loading campaigns (page $n)..."; Invoke-CampaignUiPump }
+            $script:campaignRows = @($result.Rows)
+            $script:selectedCampaign = $null
+            Update-CampaignGrid
+            Show-CampaignSelection
+            $note = if ($result.Truncated) { " List truncated after $($result.PagesRead) pages." } else { '' }
+            Append-JobLog "Campaigns: loaded $($script:campaignRows.Count) from /api/v2/outbound/campaigns/all ($($result.PagesRead) page(s)).$note"
+            Set-Status "Loaded $($script:campaignRows.Count) campaign(s).$note"
+        }
+        catch {
+            $failureText = Format-UiApiFailure -Exception $_.Exception
+            Append-JobLog "Campaign list failed: $failureText"
+            Set-Status 'Campaign list failed.'
+            $campaignListStatusText.Text = "Load failed: $failureText"
+            [System.Windows.MessageBox]::Show("Could not load campaigns:`n$failureText", 'Load Campaigns', 'OK', 'Error') | Out-Null
+        }
+        finally { $loadCampaignsBtn.IsEnabled = $true }
+    })
+
+$campaignSearchBox.Add_TextChanged({ if (@($script:campaignRows).Count -gt 0) { Update-CampaignGrid } })
+
+$campaignGrid.Add_SelectionChanged({
+        if ($script:campaignGridRebinding) { return }
+        $item = $campaignGrid.SelectedItem
+        if ($null -ne $item -and $null -ne $script:selectedCampaign -and $item.CampaignId -eq $script:selectedCampaign.CampaignId) { return }
+        $script:selectedCampaign = $item
+        Show-CampaignSelection
+    })
+
+$campaignStatusBtn.Add_Click({
+        $c = $script:selectedCampaign
+        if ($null -eq $c -or -not (Test-CampaignAuthenticated -Title 'Refresh Status')) { return }
+        Set-CampaignButtonsEnabled $false
+        $script:campaignBusyName = $c.Name
+        try {
+            $snapshot = Get-CampaignStatusSnapshot -Request $script:campaignRequest -CampaignId $c.CampaignId -MediaType $c.MediaType `
+                -OnProgress { param($n) Set-Status "Campaign '$($script:campaignBusyName)': fetching $n..."; Invoke-CampaignUiPump }
+            $script:campaignSnapshot = $snapshot
+            Show-CampaignStatus -Snapshot $snapshot
+            foreach ($e in @($snapshot.Errors)) { Append-JobLog "Campaign status: $e" }
+            Append-JobLog "Campaign status for '$($c.Name)': loaded $(@($snapshot.Sources) -join ', ')."
+            $campaignDetailTabs.SelectedIndex = 0
+            Set-Status "Campaign status refreshed for '$($c.Name)'."
+        }
+        catch {
+            $failureText = Format-UiApiFailure -Exception $_.Exception
+            Append-JobLog "Campaign status failed: $failureText"
+            Set-Status 'Campaign status failed.'
+            [System.Windows.MessageBox]::Show("Could not load campaign status:`n$failureText", 'Refresh Status', 'OK', 'Error') | Out-Null
+        }
+        finally { Set-CampaignButtonsEnabled ($null -ne $script:selectedCampaign) }
+    })
+
+$campaignRulesBtn.Add_Click({
+        $c = $script:selectedCampaign
+        if ($null -eq $c -or -not (Test-CampaignAuthenticated -Title 'Campaign Rules')) { return }
+        Set-CampaignButtonsEnabled $false
+        try {
+            $result = Get-CampaignRuleRows -Request $script:campaignRequest -CampaignId $c.CampaignId `
+                -OnProgress { param($n) Set-Status "Reading campaign rules (page $n)..."; Invoke-CampaignUiPump }
+            Set-GridRows -Grid $campaignRulesGrid -Rows @($result.Rows) -Columns $script:campaignRuleColumns
+            $note = if ($result.Truncated) { " Rule list truncated after $($result.PagesRead) pages." } else { '' }
+            $campaignRulesStatusText.Text = "$(@($result.Rows).Count) rule(s) reference this campaign, out of $($result.TotalRules) in the org.$note"
+            Append-JobLog "Campaign rules for '$($c.Name)': $(@($result.Rows).Count) of $($result.TotalRules) matched.$note"
+            $campaignDetailTabs.SelectedIndex = 1
+            Set-Status 'Campaign rules loaded.'
+        }
+        catch {
+            $failureText = Format-UiApiFailure -Exception $_.Exception
+            $campaignRulesStatusText.Text = "Rules failed: $failureText"
+            Append-JobLog "Campaign rules failed: $failureText"
+            Set-Status 'Campaign rules failed.'
+        }
+        finally { Set-CampaignButtonsEnabled ($null -ne $script:selectedCampaign) }
+    })
+
+$campaignEventsBtn.Add_Click({
+        $c = $script:selectedCampaign
+        if ($null -eq $c -or -not (Test-CampaignAuthenticated -Title 'Recent Events')) { return }
+        Set-CampaignButtonsEnabled $false
+        try {
+            $result = Get-CampaignEventRows -Request $script:campaignRequest -CampaignId $c.CampaignId -MaxPages $script:campaignEventPages `
+                -OnProgress { param($n) Set-Status "Reading outbound events (page $n)..."; Invoke-CampaignUiPump }
+            Set-GridRows -Grid $campaignEventsGrid -Rows @($result.Rows) -Columns $script:campaignEventColumns
+            $campaignEventsStatusText.Text = "$(@($result.Rows).Count) event(s) mention this campaign among the newest $($result.TotalEvents) org events scanned ($($result.PagesRead) page(s))."
+            Append-JobLog "Campaign events for '$($c.Name)': $(@($result.Rows).Count) of $($result.TotalEvents) scanned events matched."
+            $campaignDetailTabs.SelectedIndex = 2
+            Set-Status 'Campaign events loaded.'
+        }
+        catch {
+            $failureText = Format-UiApiFailure -Exception $_.Exception
+            $campaignEventsStatusText.Text = "Events failed: $failureText"
+            Append-JobLog "Campaign events failed: $failureText"
+            Set-Status 'Campaign events failed.'
+        }
+        finally { Set-CampaignButtonsEnabled ($null -ne $script:selectedCampaign) }
+    })
+
+$analyzeCampaignBtn.Add_Click({
+        # Bridge to the existing flow: one segment filter on outboundCampaignId plus a date window,
+        # then the user reviews the preview and submits the job from the Query Builder.
+        $c = $script:selectedCampaign
+        if ($null -eq $c) { return }
+        $spec = Get-CampaignAnalysisInterval -Campaign $c
+        $convFilterPanel.Children.Clear()
+        $segFilterPanel.Children.Clear()
+        $directionCombo.SelectedIndex = 0
+        $mediaTypeCombo.SelectedIndex = 0
+        $row = New-FilterRow -Type 'segment' -Panel $segFilterPanel
+        if (-not $row.Dimension.Items.Contains($spec.Dimension)) { $row.Dimension.Items.Add($spec.Dimension) | Out-Null }
+        $row.Dimension.SelectedItem = $spec.Dimension
+        $row.Dimension.Text = $spec.Dimension
+        $row.Value.Text = $spec.Value
+        Set-DatePreset -Start $spec.Start -End $spec.End
+        $mainTabControl.SelectedIndex = 0
+        $previewBtn.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
+        Append-JobLog "Campaign '$($c.Name)': Query Builder pre-filled with segment filter $($spec.Dimension) = $($spec.Value), interval $($spec.Start.ToString('yyyy-MM-dd')) to $($spec.End.ToString('yyyy-MM-dd')) ($($spec.Reason))."
+        Set-Status "Query ready for campaign '$($c.Name)' ($($spec.Reason)). Adjust the interval if needed, then Submit Async Job."
+    })
+
+$copyCampaignIdBtn.Add_Click({
+        $c = $script:selectedCampaign
+        if ($null -eq $c) { return }
+        try {
+            [System.Windows.Clipboard]::SetText([string]$c.CampaignId)
+            Set-Status "Copied campaign ID $($c.CampaignId)."
+        }
+        catch { Set-Status "Clipboard unavailable: $($_.Exception.Message)" }
+    })
 
 # -----------------------------------------------------------------------------
 # Startup: load persisted config + auto-auth
