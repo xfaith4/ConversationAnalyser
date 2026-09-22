@@ -3,7 +3,8 @@
 WPF tool for Genesys Cloud conversation detail analytics. It submits an async
 `/api/v2/analytics/conversations/details/jobs` query, collects every page of results,
 and presents them as a per-conversation grid, a drill-down detail panel, and a
-collection-level report.
+collection-level report. The Campaign Analysis tab adds outbound campaign lookup, live
+status, rules, and events, and feeds a campaign straight into the conversation query.
 
 ## Files
 
@@ -11,8 +12,11 @@ collection-level report.
 - `src/auth/PkceAuth.ps1` - OAuth 2.0 Authorization Code + PKCE (browser sign-in, local callback listener, token exchange/refresh; no UI code)
 - `src/ui/UiApiRetry.ps1` - retry/backoff helper used by the app
 - `src/analysis/ConversationAnalysis.ps1` - field extraction, flat rows, report aggregation, and HTML/JSON rendering (no UI or network code)
+- `src/campaign/CampaignAnalysis.ps1` - campaign list, status snapshot, rules, and events for the Campaign Analysis tab (no UI or network code; takes a request callback)
 - `GenesysConvAnalyzer.config.example.json` - template for the per-machine config file
 - `tests/PkceAuth.Tests.ps1` - Pester tests for the PKCE helpers
+- `tests/ConversationAnalysis.Tests.ps1` - Pester tests for the analysis helpers
+- `tests/CampaignAnalysis.Tests.ps1` - Pester tests for the campaign module (fake API, no network)
 
 ## Run
 
@@ -74,6 +78,8 @@ startup.
 
 ```powershell
 Invoke-Pester -Path .\tests\PkceAuth.Tests.ps1 -Output Detailed
+Invoke-Pester -Path .\tests\ConversationAnalysis.Tests.ps1 -Output Detailed
+Invoke-Pester -Path .\tests\CampaignAnalysis.Tests.ps1 -Output Detailed
 ```
 
 Works in Windows PowerShell 5.1 and PowerShell 7+.
@@ -125,12 +131,55 @@ Queue metrics are attributed per session: offered, answered, and abandoned count
 ACD sessions; handle metrics come from agent sessions routed through that queue. Durations
 are in seconds, and times are local.
 
+## Campaign Analysis tab
+
+Investigate one outbound campaign without leaving the app. Sign in first: every call uses
+the same token, retry policy, and Job Monitor logging as the analytics job.
+
+1. **Load Campaigns** reads every voice, SMS, and email campaign in the org
+   (`GET /api/v2/outbound/campaigns/all`). Type in the box next to it to filter by name, ID,
+   status, media type, or division; several words must all match. The grid shows Name,
+   Media, Status, Division, and Modified.
+2. Select a campaign. The header shows its ID, division, and created/modified times, and
+   the buttons become available:
+   - **Refresh Status** fetches, independently, the campaign configuration
+     (`/api/v2/outbound/campaigns/{id}`), progress (`/progress`), diagnostics
+     (`/diagnostics`), live stats (`/stats`), and the diagnostics summary
+     (`/api/v2/outbound/diagnostics/campaigns/{id}/summary`). SMS and email campaigns use
+     `/api/v2/outbound/messagingcampaigns/{id}` and its `/progress`; they have no
+     diagnostics or stats. A source that fails is listed in red on the Status tab and in
+     the Job Monitor log, and the others still render. Known fields get friendly labels;
+     anything else the API returns is shown under its raw field name, and the full payload
+     is on the Raw JSON tab.
+   - **Rules** reads every campaign rule (`/api/v2/outbound/campaignrules`; the API cannot
+     filter by campaign) and keeps the ones that watch this campaign (`trigger`), act on it
+     (`target`), or both. Conditions are joined with AND or OR according to the rule's
+     match-any setting.
+   - **Recent Events** reads the newest pages of the org-wide outbound event log
+     (`/api/v2/outbound/events`, five pages of 100) and keeps the events that mention this
+     campaign, newest first.
+   - **Analyze Conversations** clears the Query Builder filters, adds one segment filter
+     `outboundCampaignId = <id>`, sets the interval (from the campaign's creation date when
+     it was created in the last 30 days, otherwise the last 30 days, through today), and
+     shows the request preview. Review the interval, then **Submit Async Job** as usual;
+     Results and Report then describe that campaign's conversations.
+   - **Copy ID** puts the campaign ID on the clipboard.
+
+The segment filter dimension list in the Query Builder also offers `outboundCampaignId`,
+`outboundContactId`, and `outboundContactListId` for hand-built queries.
+
 ## Required permissions
 
 - Analytics conversation detail jobs (existing requirement).
 - Optional, for name resolution: read access to routing queues (`routing:queue:view`),
   wrap-up codes (`routing:wrapupCode:view`), skills, languages, and divisions. Missing
   access only affects that lookup type; the Job Monitor log shows which call failed.
+- Campaign Analysis tab: campaign view (`outbound:campaign:view`) for the list,
+  configuration, progress, diagnostics, and stats; messaging campaign view
+  (`outbound:messagingCampaign:view`) for SMS and email campaigns; campaign rule view
+  (`outbound:campaignRule:view`) for Rules; and outbound event log view
+  (`outbound:eventLog:view`) for Recent Events. A missing permission fails only that call
+  and is logged in the Job Monitor.
 
 ## Notes
 
