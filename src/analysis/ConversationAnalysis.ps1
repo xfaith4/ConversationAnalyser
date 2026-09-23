@@ -109,6 +109,113 @@ function ConvertTo-UtcDateTime {
     return $null
 }
 
+# -----------------------------------------------------------------------------
+# Business time zone (US Eastern, where HQ is located)
+# -----------------------------------------------------------------------------
+# Query intervals are typed as Eastern wall-clock times and sent to the platform in UTC,
+# which is what Genesys Cloud stores for conversationStart / conversationEnd. These helpers
+# make that conversion independent of the time zone of the machine running the app.
+
+$script:caBusinessTimeZoneIds = @('Eastern Standard Time', 'America/New_York')
+$script:caBusinessTimeZone = $null
+
+function Get-BusinessTimeZone {
+    # Windows id first, IANA id as the fallback on non-Windows hosts. Cached after first use.
+    if ($null -ne $script:caBusinessTimeZone) { return $script:caBusinessTimeZone }
+    foreach ($id in $script:caBusinessTimeZoneIds) {
+        try {
+            $script:caBusinessTimeZone = [TimeZoneInfo]::FindSystemTimeZoneById($id)
+            return $script:caBusinessTimeZone
+        }
+        catch { }
+    }
+    throw "US Eastern time zone not found on this host (tried: $($script:caBusinessTimeZoneIds -join ', '))."
+}
+
+function ConvertFrom-BusinessTime {
+    # Eastern wall-clock time -> UTC. The Kind of the input is ignored: the value is always read
+    # as Eastern. A time inside the spring-forward gap is moved forward one hour; an ambiguous
+    # fall-back time resolves to standard time (TimeZoneInfo default).
+    param([Parameter(Mandatory = $true)][DateTime]$Value)
+    $tz = Get-BusinessTimeZone
+    $wall = [DateTime]::SpecifyKind($Value, [DateTimeKind]::Unspecified)
+    if ($tz.IsInvalidTime($wall)) { $wall = $wall.AddHours(1) }
+    return [TimeZoneInfo]::ConvertTimeToUtc($wall, $tz)
+}
+
+function ConvertTo-BusinessTime {
+    # UTC -> Eastern wall-clock time (Kind Unspecified). Non-UTC input is normalised first.
+    param([Parameter(Mandatory = $true)][DateTime]$UtcValue)
+    $utc = ConvertTo-UtcDateTime $UtcValue
+    return [TimeZoneInfo]::ConvertTimeFromUtc($utc, (Get-BusinessTimeZone))
+}
+
+function Get-BusinessToday {
+    # Today's date in Eastern time, for date presets and default pickers.
+    return (ConvertTo-BusinessTime ([DateTime]::UtcNow)).Date
+}
+
+function Get-BusinessTimeZoneLabel {
+    # Short label for the UI, e.g. 'US Eastern (EDT, UTC-04:00)' for the given instant.
+    param([DateTime]$UtcValue = [DateTime]::UtcNow)
+    $tz = Get-BusinessTimeZone
+    $utc = ConvertTo-UtcDateTime $UtcValue
+    $abbrev = if ($tz.IsDaylightSavingTime($utc)) { 'EDT' } else { 'EST' }
+    $offset = $tz.GetUtcOffset($utc)
+    $sign = if ($offset -lt [TimeSpan]::Zero) { '-' } else { '+' }
+    return ('US Eastern ({0}, UTC{1}{2:hh\:mm})' -f $abbrev, $sign, $offset.Duration())
+}
+
+function ConvertFrom-IntervalString {
+    # Parses the analytics 'start/end' ISO-8601 interval into UTC DateTimes. Returns $null
+    # when the text is not a two-part interval.
+    param([AllowNull()][string]$Interval)
+    if ([string]::IsNullOrWhiteSpace($Interval)) { return $null }
+    $parts = $Interval.Split('/')
+    if ($parts.Count -ne 2) { return $null }
+    $start = ConvertTo-UtcDateTime $parts[0]
+    $end = ConvertTo-UtcDateTime $parts[1]
+    if ($null -eq $start -or $null -eq $end) { return $null }
+    return [pscustomobject]@{ StartUtc = $start; EndUtc = $end }
+}
+
+function Get-ConversationIntervalCoverage {
+    # Compares each conversation's conversationStart with the requested query interval.
+    # The details job matches any conversation with a segment inside the interval, so long-lived
+    # conversations (email, messaging, callbacks) can start well before it; this makes that visible.
+    param(
+        [AllowNull()][object[]]$Conversations,
+        [Parameter(Mandatory = $true)][string]$Interval
+    )
+    $window = ConvertFrom-IntervalString $Interval
+    if ($null -eq $window) { throw "Interval '$Interval' is not a start/end ISO-8601 interval." }
+
+    $total = 0; $inside = 0; $before = 0; $after = 0; $missing = 0
+    $earliest = $null; $latest = $null
+    foreach ($conv in @($Conversations)) {
+        if ($null -eq $conv) { continue }
+        $total++
+        $start = ConvertTo-UtcDateTime $conv.conversationStart
+        if ($null -eq $start) { $missing++; continue }
+        if ($null -eq $earliest -or $start -lt $earliest) { $earliest = $start }
+        if ($null -eq $latest -or $start -gt $latest) { $latest = $start }
+        if ($start -lt $window.StartUtc) { $before++ }
+        elseif ($start -gt $window.EndUtc) { $after++ }
+        else { $inside++ }
+    }
+    return [pscustomobject]@{
+        StartUtc         = $window.StartUtc
+        EndUtc           = $window.EndUtc
+        Total            = $total
+        Inside           = $inside
+        StartedBefore    = $before
+        StartedAfter     = $after
+        MissingStart     = $missing
+        EarliestStartUtc = $earliest
+        LatestStartUtc   = $latest
+    }
+}
+
 function Format-LocalTimestamp {
     param([AllowNull()][object]$UtcValue, [string]$Format = 'yyyy-MM-dd HH:mm:ss')
     if ($null -eq $UtcValue) { return '' }

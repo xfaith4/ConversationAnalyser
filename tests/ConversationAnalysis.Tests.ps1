@@ -206,3 +206,91 @@ Describe 'Segment error codes' {
         @($report.Observations | Where-Object { $_ -match 'error code|WebRTC' }).Count | Should -Be 0
     }
 }
+
+Describe 'Business time zone (US Eastern) interval handling' {
+    It 'resolves the Eastern time zone' {
+        (Get-BusinessTimeZone).BaseUtcOffset | Should -Be ([TimeSpan]::FromHours(-5))
+    }
+
+    It 'converts Eastern wall-clock to UTC honouring daylight saving' {
+        # EDT (UTC-4): 2026-07-01 00:00 Eastern = 04:00Z
+        $summer = ConvertFrom-BusinessTime ([DateTime]::new(2026, 7, 1, 0, 0, 0))
+        $summer.Kind | Should -Be ([DateTimeKind]::Utc)
+        $summer | Should -Be ([DateTime]::new(2026, 7, 1, 4, 0, 0, [DateTimeKind]::Utc))
+        # EST (UTC-5): 2026-01-15 23:59:59 Eastern = 2026-01-16 04:59:59Z
+        $winter = ConvertFrom-BusinessTime ([DateTime]::new(2026, 1, 15, 23, 59, 59))
+        $winter | Should -Be ([DateTime]::new(2026, 1, 16, 4, 59, 59, [DateTimeKind]::Utc))
+    }
+
+    It 'ignores the Kind of the input and always reads it as Eastern' {
+        $asLocal = [DateTime]::SpecifyKind([DateTime]::new(2026, 7, 1, 0, 0, 0), [DateTimeKind]::Local)
+        $asUtc = [DateTime]::SpecifyKind([DateTime]::new(2026, 7, 1, 0, 0, 0), [DateTimeKind]::Utc)
+        (ConvertFrom-BusinessTime $asLocal) | Should -Be ([DateTime]::new(2026, 7, 1, 4, 0, 0, [DateTimeKind]::Utc))
+        (ConvertFrom-BusinessTime $asUtc) | Should -Be ([DateTime]::new(2026, 7, 1, 4, 0, 0, [DateTimeKind]::Utc))
+    }
+
+    It 'moves a spring-forward gap time forward one hour instead of throwing' {
+        # 2026-03-08 02:30 does not exist in Eastern; it becomes 03:30 EDT = 07:30Z
+        $gap = ConvertFrom-BusinessTime ([DateTime]::new(2026, 3, 8, 2, 30, 0))
+        $gap | Should -Be ([DateTime]::new(2026, 3, 8, 7, 30, 0, [DateTimeKind]::Utc))
+    }
+
+    It 'round-trips UTC back to Eastern' {
+        $utc = [DateTime]::new(2026, 9, 1, 4, 0, 0, [DateTimeKind]::Utc)
+        (ConvertTo-BusinessTime $utc) | Should -Be ([DateTime]::new(2026, 9, 1, 0, 0, 0))
+        (ConvertTo-BusinessTime ([DateTime]::new(2026, 9, 1, 4, 0, 0, [DateTimeKind]::Unspecified))) | Should -Be ([DateTime]::new(2026, 9, 1, 0, 0, 0))
+    }
+
+    It 'labels the zone with the abbreviation and offset in force' {
+        Get-BusinessTimeZoneLabel -UtcValue ([DateTime]::new(2026, 7, 1, 12, 0, 0, [DateTimeKind]::Utc)) | Should -Be 'US Eastern (EDT, UTC-04:00)'
+        Get-BusinessTimeZoneLabel -UtcValue ([DateTime]::new(2026, 1, 1, 12, 0, 0, [DateTimeKind]::Utc)) | Should -Be 'US Eastern (EST, UTC-05:00)'
+    }
+
+    It 'parses a start/end interval string into UTC' {
+        $w = ConvertFrom-IntervalString '2026-09-01T04:00:00.000Z/2026-09-02T03:59:59.000Z'
+        $w.StartUtc | Should -Be ([DateTime]::new(2026, 9, 1, 4, 0, 0, [DateTimeKind]::Utc))
+        $w.EndUtc | Should -Be ([DateTime]::new(2026, 9, 2, 3, 59, 59, [DateTimeKind]::Utc))
+        ConvertFrom-IntervalString '' | Should -BeNullOrEmpty
+        ConvertFrom-IntervalString 'not-an-interval' | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-ConversationIntervalCoverage' {
+    BeforeAll {
+        $script:interval = '2026-09-01T04:00:00.000Z/2026-09-02T03:59:59.000Z'
+        function New-StartOnly { param([string]$Id, [object]$Start) [pscustomobject]@{ conversationId = $Id; conversationStart = $Start } }
+    }
+
+    It 'classifies conversationStart against the requested interval' {
+        $convs = @(
+            (New-StartOnly 'inside-1' '2026-09-01T04:00:00.000Z'),
+            (New-StartOnly 'inside-2' '2026-09-02T03:59:59.000Z'),
+            (New-StartOnly 'before-month' '2026-08-02T10:00:00.000Z'),
+            (New-StartOnly 'before-second' '2026-09-01T03:59:59.999Z'),
+            (New-StartOnly 'after' '2026-09-02T04:00:00.000Z'),
+            (New-StartOnly 'missing' $null)
+        )
+        $cov = Get-ConversationIntervalCoverage -Conversations $convs -Interval $script:interval
+        $cov.Total | Should -Be 6
+        $cov.Inside | Should -Be 2
+        $cov.StartedBefore | Should -Be 2
+        $cov.StartedAfter | Should -Be 1
+        $cov.MissingStart | Should -Be 1
+        $cov.EarliestStartUtc | Should -Be ([DateTime]::new(2026, 8, 2, 10, 0, 0, [DateTimeKind]::Utc))
+        $cov.LatestStartUtc | Should -Be ([DateTime]::new(2026, 9, 2, 4, 0, 0, [DateTimeKind]::Utc))
+    }
+
+    It 'accepts DateTime values as produced by ConvertFrom-Json' {
+        $json = '[{"conversationId":"a","conversationStart":"2026-09-01T12:00:00.000Z"},{"conversationId":"b","conversationStart":"2026-07-01T12:00:00.000Z"}]'
+        $cov = Get-ConversationIntervalCoverage -Conversations @($json | ConvertFrom-Json) -Interval $script:interval
+        $cov.Inside | Should -Be 1
+        $cov.StartedBefore | Should -Be 1
+    }
+
+    It 'handles an empty collection and rejects a malformed interval' {
+        $cov = Get-ConversationIntervalCoverage -Conversations @() -Interval $script:interval
+        $cov.Total | Should -Be 0
+        $cov.EarliestStartUtc | Should -BeNullOrEmpty
+        { Get-ConversationIntervalCoverage -Conversations @() -Interval 'bad' } | Should -Throw
+    }
+}

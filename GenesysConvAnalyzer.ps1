@@ -247,6 +247,7 @@ $script:userLookupBatchSize = 50     # user IDs per GET /api/v2/users?id=... cal
 $script:dataSource = ''              # shown in the report header ("Analytics job <id>" or "File <name>")
 $script:dataQueryInterval = ''
 $script:currentJobInterval = ''
+$script:currentJobStartOfDayMatching = $false
 
 # -- Polling and paging guardrails ---------------------------------------------
 $script:maxPollCount = 600    # Stop polling after this many attempts (~30 min at 3s interval)
@@ -645,6 +646,7 @@ function Read-ConversationsFromFile {
                 <Grid.RowDefinitions>
                   <RowDefinition Height="Auto"/>
                   <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
                 <!-- Quick presets row -->
                 <Label   Grid.Row="0" Grid.Column="0" Content="Preset:"/>
@@ -658,13 +660,21 @@ function Read-ConversationsFromFile {
                 <Label       Grid.Row="1" Grid.Column="0" Content="From:"/>
                 <DatePicker  Grid.Row="1" Grid.Column="1" Name="StartDatePicker" Width="130" Margin="2"/>
                 <Label       Grid.Row="1" Grid.Column="2" Content="Time:"/>
-                <TextBox     Grid.Row="1" Grid.Column="3" Name="StartTimeTextBox" Width="90" Margin="2" ToolTip="Local time. Formats: HH:mm or HH:mm:ss"/>
+                <TextBox     Grid.Row="1" Grid.Column="3" Name="StartTimeTextBox" Width="90" Margin="2" ToolTip="US Eastern time (business HQ). Formats: HH:mm or HH:mm:ss"/>
                 <Label       Grid.Row="1" Grid.Column="4" Content="To:"/>
                 <DatePicker  Grid.Row="1" Grid.Column="5" Name="EndDatePicker"   Width="130" Margin="2"/>
                 <Label       Grid.Row="1" Grid.Column="6" Content="Time:"/>
-                <TextBox     Grid.Row="1" Grid.Column="7" Name="EndTimeTextBox" Width="90" Margin="2" ToolTip="Local time. Formats: HH:mm or HH:mm:ss"/>
-                <TextBlock   Grid.Row="1" Grid.Column="8" Grid.ColumnSpan="4" Margin="8,0,0,0" VerticalAlignment="Center" Foreground="Gray"
-                             Text="Blank times default to 00:00:00 for start and 23:59:59 for end." TextWrapping="Wrap"/>
+                <TextBox     Grid.Row="1" Grid.Column="7" Name="EndTimeTextBox" Width="90" Margin="2" ToolTip="US Eastern time (business HQ). Formats: HH:mm or HH:mm:ss"/>
+                <TextBlock   Grid.Row="1" Grid.Column="8" Grid.ColumnSpan="5" Margin="8,0,0,0" VerticalAlignment="Center" Foreground="Gray" TextWrapping="Wrap"
+                             Name="IntervalHintText"
+                             Text="Enter dates and times in US Eastern (business HQ). The query is sent in UTC. Blank times default to 00:00:00 start / 23:59:59 end."/>
+                <!-- Interval options row -->
+                <CheckBox    Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="8" Margin="4,4,2,2" VerticalAlignment="Center"
+                             Name="StartOfDayMatchingCheckBox" IsChecked="True"
+                             Content="Only conversations that started on/after the interval start date (startOfDayIntervalMatching)"
+                             ToolTip="Adds startOfDayIntervalMatching=true to the job. Without it the platform returns every conversation with any segment inside the interval, so long-lived email, message, or callback conversations that started days or weeks earlier are included."/>
+                <TextBlock   Grid.Row="2" Grid.Column="8" Grid.ColumnSpan="5" Margin="8,0,0,0" VerticalAlignment="Center" Foreground="Gray" TextWrapping="Wrap"
+                             Name="IntervalUtcText" Text=""/>
               </Grid>
             </GroupBox>
 
@@ -1074,6 +1084,8 @@ $startDatePicker = Get-Control 'StartDatePicker'
 $startTimeTextBox = Get-Control 'StartTimeTextBox'
 $endDatePicker = Get-Control 'EndDatePicker'
 $endTimeTextBox = Get-Control 'EndTimeTextBox'
+$startOfDayCheckBox = Get-Control 'StartOfDayMatchingCheckBox'
+$intervalUtcText = Get-Control 'IntervalUtcText'
 $directionCombo = Get-Control 'DirectionCombo'
 $mediaTypeCombo = Get-Control 'MediaTypeCombo'
 $orderByCombo = Get-Control 'OrderByCombo'
@@ -1296,7 +1308,7 @@ function Resolve-SelectedDateValue {
         }
     }
 
-    return [DateTime]::Today
+    return Get-BusinessToday
 }
 
 function Resolve-TimeOfDayValue {
@@ -1331,25 +1343,27 @@ function Resolve-IntervalSelection {
     $startTime = Resolve-TimeOfDayValue -Text ([string]$startTimeTextBox.Text) -DefaultValue ([TimeSpan]::Zero) -Label 'Start time'
     $endTime = Resolve-TimeOfDayValue -Text ([string]$endTimeTextBox.Text) -DefaultValue ([TimeSpan]::new(23, 59, 59)) -Label 'End time'
 
-    $startLocal = $startDate.Date.Add($startTime)
-    $endLocal = $endDate.Date.Add($endTime)
-    if ($endLocal -le $startLocal) {
+    # The pickers hold US Eastern wall-clock times (business HQ), whatever the machine's zone is.
+    # Genesys Cloud stores conversationStart/conversationEnd in UTC, so the interval is sent in UTC.
+    $startEastern = $startDate.Date.Add($startTime)
+    $endEastern = $endDate.Date.Add($endTime)
+    if ($endEastern -le $startEastern) {
         throw "End date/time must be after start date/time."
     }
 
-    $startUtc = [DateTime]::SpecifyKind($startLocal, [System.DateTimeKind]::Local).ToUniversalTime()
-    $endUtc = [DateTime]::SpecifyKind($endLocal, [System.DateTimeKind]::Local).ToUniversalTime()
+    $startUtc = ConvertFrom-BusinessTime $startEastern
+    $endUtc = ConvertFrom-BusinessTime $endEastern
 
     return [pscustomobject]@{
-        StartDate  = $startDate
-        EndDate    = $endDate
-        StartTime  = $startTime
-        EndTime    = $endTime
-        StartLocal = $startLocal
-        EndLocal   = $endLocal
-        StartUtc   = $startUtc
-        EndUtc     = $endUtc
-        Interval   = "$($startUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))/$($endUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))"
+        StartDate    = $startDate
+        EndDate      = $endDate
+        StartTime    = $startTime
+        EndTime      = $endTime
+        StartEastern = $startEastern
+        EndEastern   = $endEastern
+        StartUtc     = $startUtc
+        EndUtc       = $endUtc
+        Interval     = "$($startUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))/$($endUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))"
     }
 }
 
@@ -1408,10 +1422,14 @@ function Test-RegionValue {
 function Build-QueryBody {
     $intervalSelection = Resolve-IntervalSelection
     Set-IntervalControlDefaults -Resolved $intervalSelection
+    $intervalUtcText.Text = "Sent as UTC: $($intervalSelection.Interval)  ($(Get-BusinessTimeZoneLabel -UtcValue $intervalSelection.StartUtc))"
     $body = [ordered]@{
-        interval = $intervalSelection.Interval
-        order    = Get-ComboValue $orderCombo
-        orderBy  = Get-ComboValue $orderByCombo
+        interval                   = $intervalSelection.Interval
+        # Only conversations whose conversationStart is on/after 00:00 UTC of the interval start date.
+        # Without it the job returns any conversation with a segment inside the interval.
+        startOfDayIntervalMatching = [bool]$startOfDayCheckBox.IsChecked
+        order                      = Get-ComboValue $orderCombo
+        orderBy                    = Get-ComboValue $orderByCombo
     }
 
     # Quick filter: direction
@@ -1703,7 +1721,14 @@ function Update-ReportView {
     $reportHeadlineText.Text = $report.Headline
     $scope = [System.Collections.Generic.List[string]]::new()
     $scope.Add("Data window: $($report.WindowStartLocal) to $($report.WindowEndLocal) ($($report.TimeZone))") | Out-Null
-    if ($report.QueryInterval) { $scope.Add("Query interval (UTC): $($report.QueryInterval)") | Out-Null }
+    if ($report.QueryInterval) {
+        $line = "Query interval (UTC): $($report.QueryInterval)"
+        $window = ConvertFrom-IntervalString $report.QueryInterval
+        if ($null -ne $window) {
+            $line += " = $((ConvertTo-BusinessTime $window.StartUtc).ToString('yyyy-MM-dd HH:mm:ss')) to $((ConvertTo-BusinessTime $window.EndUtc).ToString('yyyy-MM-dd HH:mm:ss')) US Eastern"
+        }
+        $scope.Add($line) | Out-Null
+    }
     if ($report.Source) { $scope.Add("Source: $($report.Source)") | Out-Null }
     $scope.Add("Generated: $($report.GeneratedLocal)") | Out-Null
     $scope.Add($report.Units) | Out-Null
@@ -2122,6 +2147,7 @@ function Set-DatePreset {
     # Presets always apply the canonical full-day range: 00:00:00 start, 23:59:59 end.
     # Times are set unconditionally so each preset produces a deterministic interval
     # regardless of any value previously typed into the time boxes.
+    # Dates are US Eastern calendar dates (see Resolve-IntervalSelection).
     param([DateTime]$Start, [DateTime]$End)
     $startDatePicker.SelectedDate = $Start
     $endDatePicker.SelectedDate = $End
@@ -2130,24 +2156,24 @@ function Set-DatePreset {
 }
 
 (Get-Control 'PresetToday').Add_Click({
-        $t = [DateTime]::Today; Set-DatePreset -Start $t -End $t
+        $t = Get-BusinessToday; Set-DatePreset -Start $t -End $t
     })
 (Get-Control 'PresetYesterday').Add_Click({
-        $y = [DateTime]::Today.AddDays(-1); Set-DatePreset -Start $y -End $y
+        $y = (Get-BusinessToday).AddDays(-1); Set-DatePreset -Start $y -End $y
     })
 (Get-Control 'PresetLast7').Add_Click({
-        Set-DatePreset -Start ([DateTime]::Today.AddDays(-6)) -End ([DateTime]::Today)
+        $t = Get-BusinessToday; Set-DatePreset -Start $t.AddDays(-6) -End $t
     })
 (Get-Control 'PresetLast30').Add_Click({
-        Set-DatePreset -Start ([DateTime]::Today.AddDays(-29)) -End ([DateTime]::Today)
+        $t = Get-BusinessToday; Set-DatePreset -Start $t.AddDays(-29) -End $t
     })
 (Get-Control 'PresetThisMonth').Add_Click({
-        $now = [DateTime]::Today
+        $now = Get-BusinessToday
         $s = [DateTime]::new($now.Year, $now.Month, 1)
         Set-DatePreset -Start $s -End $now
     })
 (Get-Control 'PresetLastMonth').Add_Click({
-        $now = [DateTime]::Today
+        $now = Get-BusinessToday
         $s = [DateTime]::new($now.Year, $now.Month, 1).AddMonths(-1)
         $e = [DateTime]::new($now.Year, $now.Month, 1).AddDays(-1)
         Set-DatePreset -Start $s -End $e
@@ -2252,6 +2278,7 @@ $submitJobBtn.Add_Click({
 
             $script:currentJobId = $jobId
             $script:currentJobInterval = [string]$body['interval']
+            $script:currentJobStartOfDayMatching = [bool]$body['startOfDayIntervalMatching']
             $script:pollCount = 0
             $script:consecutivePollErrors = 0
             $script:jobSubmitTime = [DateTime]::UtcNow
@@ -2312,6 +2339,32 @@ $cancelJobBtn.Add_Click({
 
 # -- Collect results -----------------------------------------------------------
 
+function Write-IntervalCoverageLog {
+    # Logs how the collected conversationStart values relate to the requested interval so a
+    # result set that reaches back before the interval (overlap matching) is visible at once.
+    param([AllowNull()][string]$Interval)
+    if ([string]::IsNullOrWhiteSpace($Interval) -or $script:allConversations.Count -eq 0) { return }
+    try {
+        $cov = Get-ConversationIntervalCoverage -Conversations @($script:allConversations) -Interval $Interval
+        $fmt = 'yyyy-MM-dd HH:mm:ss'
+        Append-JobLog ("Interval check (conversationStart vs. query interval, UTC): {0} inside, {1} started before, {2} started after, {3} without a start." -f $cov.Inside, $cov.StartedBefore, $cov.StartedAfter, $cov.MissingStart)
+        if ($null -ne $cov.EarliestStartUtc) {
+            Append-JobLog ("  Earliest start: {0} UTC ({1} Eastern); latest start: {2} UTC ({3} Eastern)." -f $cov.EarliestStartUtc.ToString($fmt), (ConvertTo-BusinessTime $cov.EarliestStartUtc).ToString($fmt), $cov.LatestStartUtc.ToString($fmt), (ConvertTo-BusinessTime $cov.LatestStartUtc).ToString($fmt))
+        }
+        if ($cov.StartedBefore -gt 0) {
+            if ($script:currentJobStartOfDayMatching) {
+                Append-JobLog "  $($cov.StartedBefore) conversation(s) started before the interval start time but on/after 00:00 UTC of its start date (startOfDayIntervalMatching cuts at the UTC date, not the exact time)."
+            }
+            else {
+                Append-JobLog "  $($cov.StartedBefore) conversation(s) started before the interval. They overlap it (a segment falls inside); tick 'startOfDayIntervalMatching' in the Query Builder to exclude them."
+            }
+        }
+    }
+    catch {
+        Append-JobLog "Interval check skipped: $($_.Exception.Message)"
+    }
+}
+
 $collectResultsBtn.Add_Click({
         $collectResultsBtn.IsEnabled = $false
         Clear-ConversationStore
@@ -2362,6 +2415,7 @@ $collectResultsBtn.Add_Click({
 
             Append-JobLog "Collection complete. $($script:allConversations.Count) total conversations across $page pages."
             Set-Status "Collection complete: $($script:allConversations.Count) conversations."
+            Write-IntervalCoverageLog -Interval $script:currentJobInterval
 
             $script:dataSource = "Analytics job $($script:currentJobId)"
             $script:dataQueryInterval = $script:currentJobInterval
@@ -2378,6 +2432,7 @@ $collectResultsBtn.Add_Click({
             # Show partial results if any were collected before the error
             if ($script:allConversations.Count -gt 0) {
                 Append-JobLog "Showing $($script:allConversations.Count) partial results collected before failure."
+                Write-IntervalCoverageLog -Interval $script:currentJobInterval
                 $script:dataSource = "Analytics job $($script:currentJobId) (partial: failed on page $page)"
                 $script:dataQueryInterval = $script:currentJobInterval
                 Show-Results
@@ -2903,7 +2958,7 @@ $analyzeCampaignBtn.Add_Click({
         # then the user reviews the preview and submits the job from the Query Builder.
         $c = $script:selectedCampaign
         if ($null -eq $c) { return }
-        $spec = Get-CampaignAnalysisInterval -Campaign $c
+        $spec = Get-CampaignAnalysisInterval -Campaign $c -Today (Get-BusinessToday) -TimeZone (Get-BusinessTimeZone)
         $convFilterPanel.Children.Clear()
         $segFilterPanel.Children.Clear()
         $directionCombo.SelectedIndex = 0
@@ -2934,8 +2989,8 @@ $copyCampaignIdBtn.Add_Click({
 # Startup: load persisted config + auto-auth
 # -----------------------------------------------------------------------------
 
-$startDatePicker.SelectedDate = [DateTime]::Today
-$endDatePicker.SelectedDate = [DateTime]::Today
+$startDatePicker.SelectedDate = Get-BusinessToday
+$endDatePicker.SelectedDate = Get-BusinessToday
 $startTimeTextBox.Text = '00:00:00'
 $endTimeTextBox.Text = '23:59:59'
 Set-IntervalControlDefaults

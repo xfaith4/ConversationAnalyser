@@ -84,6 +84,28 @@ Invoke-Pester -Path .\tests\CampaignAnalysis.Tests.ps1 -Output Detailed
 
 Works in Windows PowerShell 5.1 and PowerShell 7+.
 
+## Query Builder: interval and time zones
+
+- **Dates and times are entered in US Eastern** (business HQ), whatever time zone the
+  machine runs in. The app converts them to UTC, which is what Genesys Cloud stores for
+  `conversationStart` and `conversationEnd`, and shows the exact UTC interval it will send
+  under the pickers after **Preview** or **Submit**. Daylight saving is handled per date
+  (EDT/EST); a start time that falls in the spring-forward gap is moved forward one hour.
+  The presets (Today, Yesterday, Last 7 Days, ...) also use the Eastern calendar date.
+- **startOfDayIntervalMatching** (checkbox, on by default) sends
+  `"startOfDayIntervalMatching": true` with the job. The details job otherwise matches any
+  conversation that has a segment inside the interval, so long-lived email, message, and
+  callback conversations that started days or weeks earlier are returned too. With the flag
+  on, only conversations whose `conversationStart` is on or after 00:00 UTC of the interval
+  start date are included. Note that the cut-off is the start *date* in UTC, not the exact
+  start time, so a few conversations from the hours just before the interval can still
+  appear; the interval check in the Job Monitor makes that visible.
+- **Interval check**: after every collection the Job Monitor logs how many conversations
+  started inside, before, or after the requested interval, plus the earliest and latest
+  `conversationStart` in UTC and Eastern. Nothing is dropped; the numbers are there so a
+  result set that reaches back beyond the interval is obvious at once.
+- The Report tab shows the query interval in UTC and its Eastern equivalent.
+
 ## Results tab
 
 - **Grid**: one row per conversation with about 90 standard columns (see the column
@@ -129,7 +151,8 @@ Built from all loaded conversations:
 
 Queue metrics are attributed per session: offered, answered, and abandoned counts come from
 ACD sessions; handle metrics come from agent sessions routed through that queue. Durations
-are in seconds, and times are local.
+are in seconds, and times are shown in the machine's local time zone (the query interval
+itself is entered in US Eastern; see the Query Builder section).
 
 ## Campaign Analysis tab
 
@@ -198,8 +221,8 @@ The segment filter dimension list in the Query Builder also offers `outboundCamp
 | Column | Default grid | Description |
 | --- | --- | --- |
 | `ConversationId` | Yes | Genesys Cloud conversation ID. |
-| `Start` | Yes | Conversation start (local time). |
-| `End` | No | Conversation end (local time); blank while still active. |
+| `Start` | Yes | Conversation start (`conversationStart`, UTC on the platform, shown in machine-local time). |
+| `End` | No | Conversation end (`conversationEnd`, shown in machine-local time); blank while still active. |
 | `StartDate` | No | Local start date (yyyy-MM-dd), for pivoting. |
 | `StartHour` | No | Local start hour (0-23), for pivoting. |
 | `DayOfWeek` | No | Local start day of week. |
