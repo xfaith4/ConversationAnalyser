@@ -589,6 +589,10 @@ function Read-ConversationsFromFile {
       <Setter Property="Margin" Value="2"/>
       <Setter Property="VerticalAlignment" Value="Center"/>
     </Style>
+    <Style TargetType="DatePicker">
+      <Setter Property="Margin" Value="2"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
   </Window.Resources>
 
   <Grid Margin="8">
@@ -655,6 +659,8 @@ function Read-ConversationsFromFile {
                   <RowDefinition Height="Auto"/>
                   <RowDefinition Height="Auto"/>
                   <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
                 <!-- Quick presets row -->
                 <Label   Grid.Row="0" Grid.Column="0" Content="Preset:"/>
@@ -666,22 +672,23 @@ function Read-ConversationsFromFile {
                 <Button  Grid.Row="0" Grid.Column="6" Name="PresetLastMonth" Content="Last Month"/>
                 <!-- Date picker row -->
                 <Label       Grid.Row="1" Grid.Column="0" Content="From:"/>
-                <DatePicker  Grid.Row="1" Grid.Column="1" Name="StartDatePicker" Width="130" Margin="2"/>
+                <DatePicker  Grid.Row="1" Grid.Column="1" Name="StartDatePicker" Width="130"/>
                 <Label       Grid.Row="1" Grid.Column="2" Content="Time:"/>
-                <TextBox     Grid.Row="1" Grid.Column="3" Name="StartTimeTextBox" Width="90" Margin="2" ToolTip="US Eastern time (business HQ). Formats: HH:mm or HH:mm:ss"/>
+                <TextBox     Grid.Row="1" Grid.Column="3" Name="StartTimeTextBox" Width="90" ToolTip="US Eastern time (business HQ). Formats: HH:mm or HH:mm:ss"/>
                 <Label       Grid.Row="1" Grid.Column="4" Content="To:"/>
-                <DatePicker  Grid.Row="1" Grid.Column="5" Name="EndDatePicker"   Width="130" Margin="2"/>
+                <DatePicker  Grid.Row="1" Grid.Column="5" Name="EndDatePicker"   Width="130"/>
                 <Label       Grid.Row="1" Grid.Column="6" Content="Time:"/>
-                <TextBox     Grid.Row="1" Grid.Column="7" Name="EndTimeTextBox" Width="90" Margin="2" ToolTip="US Eastern time (business HQ). Formats: HH:mm or HH:mm:ss"/>
-                <TextBlock   Grid.Row="1" Grid.Column="8" Grid.ColumnSpan="5" Margin="8,0,0,0" VerticalAlignment="Center" Foreground="Gray" TextWrapping="Wrap"
+                <TextBox     Grid.Row="1" Grid.Column="7" Name="EndTimeTextBox" Width="90" ToolTip="US Eastern time (business HQ). Formats: HH:mm or HH:mm:ss"/>
+                <!-- Hint and options rows span the full width so wrapping text can never squeeze a
+                     column and inflate the picker row (that is what stretched the DatePickers before). -->
+                <TextBlock   Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="13" Margin="4,2,2,2" Foreground="Gray" TextWrapping="Wrap"
                              Name="IntervalHintText"
                              Text="Enter dates and times in US Eastern (business HQ). The query is sent in UTC. Blank times default to 00:00:00 start / 23:59:59 end."/>
-                <!-- Interval options row -->
-                <CheckBox    Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="8" Margin="4,4,2,2" VerticalAlignment="Center"
+                <CheckBox    Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="13" Margin="4,4,2,2" VerticalAlignment="Center"
                              Name="StartOfDayMatchingCheckBox" IsChecked="True"
                              Content="Only conversations that started on/after the interval start date (startOfDayIntervalMatching)"
                              ToolTip="Adds startOfDayIntervalMatching=true to the job. Without it the platform returns every conversation with any segment inside the interval, so long-lived email, message, or callback conversations that started days or weeks earlier are included."/>
-                <TextBlock   Grid.Row="2" Grid.Column="8" Grid.ColumnSpan="5" Margin="8,0,0,0" VerticalAlignment="Center" Foreground="Gray" TextWrapping="Wrap"
+                <TextBlock   Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="13" Margin="4,2,2,2" Foreground="Gray" TextWrapping="Wrap"
                              Name="IntervalUtcText" Text=""/>
               </Grid>
             </GroupBox>
