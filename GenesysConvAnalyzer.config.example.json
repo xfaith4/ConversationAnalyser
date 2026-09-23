@@ -3,5 +3,13 @@
   "authMode": "pkce",
   "clientId": "00000000-0000-0000-0000-000000000000",
   "redirectUri": "http://localhost:8085/callback/",
-  "scope": ""
+  "scope": "",
+  "reportThresholds": {
+    "AbandonPct": 5,
+    "WithinSlaPct": 80,
+    "TransferPct": 15,
+    "PoorMosPct": 2,
+    "NotResponding": 5,
+    "SystemDisconnectPct": 5
+  }
 }

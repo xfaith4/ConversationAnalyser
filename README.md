@@ -149,6 +149,33 @@ Built from all loaded conversations:
 - **Export Report (HTML)** - a self-contained HTML file (light/dark aware, printable) plus a
   `.json` file with the same numbers for downstream tools.
 
+### HTML report layout
+
+The exported page is ordered for investigation: awareness first, evidence underneath.
+
+1. **Headline and observations** - the flags that crossed a threshold, with the thresholds in
+   use stated beneath them.
+2. **Dashboard** - inline SVG charts (no external dependencies): daily and hourly trends
+   (volume bars over an abandon-rate line), disconnect reasons, segment error codes (agent
+   WebRTC drops highlighted), queue abandon rate, and agents not responding. Dashed lines are
+   the reference thresholds, flagged marks carry a marker glyph as well as colour, every mark
+   has a hover tooltip, and each panel links to the table that holds its evidence.
+3. **Key metrics** - the KPI tiles.
+4. **Breakdowns** - every table in a collapsible section with a one-line summary. Short
+   aggregate tables open by default; drill-down lists (Agents, Longest, Lowest MOS, Error
+   Conversations) stay collapsed; tables over 25 rows show 25 until you press *Show all*. The
+   sticky nav has *Expand all* / *Collapse all*, and a floating *Top* button returns to the
+   headline.
+
+**Printing** produces the executive brief: headline, observations, dashboard, and tiles. The
+breakdown tables are left out of the PDF on purpose; investigators use the HTML.
+
+**Thresholds** default to abandon 5%, within service level 80%, transfers 15%, poor MOS 2%,
+unanswered alerts per agent 5, platform disconnects 5%. Override any of them with a
+`reportThresholds` object in the config file (see `GenesysConvAnalyzer.config.example.json`);
+the values in use are written into the observations, the chart reference lines, and the JSON
+export.
+
 Queue metrics are attributed per session: offered, answered, and abandoned counts come from
 ACD sessions; handle metrics come from agent sessions routed through that queue. Durations
 are in seconds, and times are shown in the machine's local time zone (the query interval

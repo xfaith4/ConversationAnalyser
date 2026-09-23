@@ -157,6 +157,14 @@ function Read-GenesysEnvConfig {
     try { return Get-Content $script:configPath -Raw -Encoding utf8 | ConvertFrom-Json } catch { return $null }
 }
 
+function Get-ConfiguredReportThresholds {
+    # Optional reportThresholds object from the config file (see GenesysConvAnalyzer.config.example.json).
+    # Keys match Get-DefaultReportThresholds; missing keys keep their defaults.
+    $cfg = Read-GenesysEnvConfig
+    if ($null -eq $cfg -or $null -eq $cfg.PSObject.Properties['reportThresholds']) { return $null }
+    return $cfg.reportThresholds
+}
+
 function Save-GenesysEnvConfig {
     # Rewrites the config file with the values in use, preserving any other keys it had.
     param([string]$Region, [string]$ClientId, [string]$RedirectUri, [string]$AuthMode, [string]$Scope)
@@ -1714,7 +1722,7 @@ function Update-ReportView {
         if ($null -eq $Profiles) { $Profiles = @(Update-ConversationProfiles) }
         Set-Status 'Building report...'
         [System.Windows.Forms.Application]::DoEvents()
-        $script:currentReport = Get-ConversationReport -Profiles $Profiles -Lookups $script:lookups -Source $script:dataSource -QueryInterval $script:dataQueryInterval
+        $script:currentReport = Get-ConversationReport -Profiles $Profiles -Lookups $script:lookups -Source $script:dataSource -QueryInterval $script:dataQueryInterval -Thresholds (Get-ConfiguredReportThresholds)
     }
     $report = $script:currentReport
 

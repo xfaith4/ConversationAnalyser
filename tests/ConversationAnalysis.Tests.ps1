@@ -294,3 +294,99 @@ Describe 'Get-ConversationIntervalCoverage' {
         { Get-ConversationIntervalCoverage -Conversations @() -Interval 'bad' } | Should -Throw
     }
 }
+
+Describe 'Report thresholds and HTML layout' {
+    BeforeAll {
+        $script:abandonedConv = New-TestConversation -Id 'ab-1'
+        # Drop both agents so the ACD leg is an abandon: nOffered + tAbandon, nobody answers.
+        $script:abandonedConv.participants = @($script:abandonedConv.participants[0], $script:abandonedConv.participants[1])
+        $script:abandonedConv.participants[1].sessions[0].metrics = @(
+            [pscustomobject]@{ name = 'nOffered'; value = 1; emitDate = '2026-09-01T10:00:01.000Z' },
+            [pscustomobject]@{ name = 'tAbandon'; value = 20000; emitDate = '2026-09-01T10:00:01.000Z' })
+        $script:okConv = New-TestConversation -Id 'ok-2'
+        $script:okConv.participants[1].sessions[0].metrics = @(
+            [pscustomobject]@{ name = 'nOffered'; value = 1; emitDate = '2026-09-01T10:00:01.000Z' },
+            [pscustomobject]@{ name = 'tAnswered'; value = 5000; emitDate = '2026-09-01T10:00:01.000Z' })
+        $script:okConv.participants[2].sessions[0].metrics += [pscustomobject]@{ name = 'tNotResponding'; value = 30000; emitDate = '2026-09-01T10:00:02.000Z' }
+        $script:layoutProfiles = @(
+            (Get-ConversationProfile -Conversation $script:abandonedConv),
+            (Get-ConversationProfile -Conversation $script:okConv))
+        $script:layoutLookups = New-ConversationLookupTable
+    }
+
+    It 'ships defaults and merges overrides from a hashtable or a JSON object, ignoring unknown keys' {
+        $defaults = Get-DefaultReportThresholds
+        $defaults.AbandonPct | Should -Be 5
+        $defaults.NotResponding | Should -Be 5
+        $merged = Resolve-ReportThresholds -Overrides @{ abandonpct = 12.5; NotResponding = '3'; Bogus = 99 }
+        $merged.AbandonPct | Should -Be 12.5
+        $merged.NotResponding | Should -Be 3
+        $merged.WithinSlaPct | Should -Be 80
+        $merged.Contains('Bogus') | Should -BeFalse
+        $fromJson = Resolve-ReportThresholds -Overrides ('{"SystemDisconnectPct": 2, "TransferPct": "not a number"}' | ConvertFrom-Json)
+        $fromJson.SystemDisconnectPct | Should -Be 2
+        $fromJson.TransferPct | Should -Be 15
+    }
+
+    It 'applies the thresholds to the observations and exposes them on the report and in the JSON' {
+        $loose = Get-ConversationReport -Profiles $script:layoutProfiles -Lookups $script:layoutLookups -Source 'test' -QueryInterval '' -Thresholds @{ AbandonPct = 60; NotResponding = 2 }
+        $loose.Thresholds.AbandonPct | Should -Be 60
+        @($loose.Observations | Where-Object { $_ -match 'Abandon rate is' }).Count | Should -Be 0
+        @($loose.Observations | Where-Object { $_ -match 'unanswered alerts' }).Count | Should -Be 0
+        $strict = Get-ConversationReport -Profiles $script:layoutProfiles -Lookups $script:layoutLookups -Source 'test' -QueryInterval '' -Thresholds @{ AbandonPct = 40; NotResponding = 1 }
+        @($strict.Observations | Where-Object { $_ -match 'above the 40% reference threshold' }).Count | Should -Be 1
+        @($strict.Observations | Where-Object { $_ -match 'tNotResponding; 1 reference' }).Count | Should -Be 1
+        $json = ConvertTo-ConversationReportJson -Report $strict | ConvertFrom-Json
+        $json.thresholds.AbandonPct | Should -Be 40
+        $json.thresholds.NotResponding | Should -Be 1
+    }
+
+    It 'renders the dashboard charts above the KPI tiles with threshold lines and evidence links' {
+        $report = Get-ConversationReport -Profiles $script:layoutProfiles -Lookups $script:layoutLookups -Source 'test' -QueryInterval '' -Thresholds @{ AbandonPct = 7.5 }
+        $charts = @(Get-ReportChartSet -Report $report)
+        $charts.Title | Should -Contain 'Disconnect reasons'
+        $charts.Title | Should -Contain 'Queue abandon rate'
+        $charts.Title | Should -Contain 'Agents not responding'
+        $charts.Title | Should -Not -Contain 'Daily trend'   # a single day is not a trend
+        $html = ConvertTo-ConversationReportHtml -Report $report
+        $html.IndexOf('id="observations"') | Should -BeLessThan $html.IndexOf('id="dashboard"')
+        $html.IndexOf('id="dashboard"') | Should -BeLessThan $html.IndexOf('id="kpis"')
+        $html.IndexOf('id="kpis"') | Should -BeLessThan $html.IndexOf('id="tables"')
+        $html | Should -Match '<svg viewBox='
+        $html | Should -Match 'class="ref"'
+        $html | Should -Match 'ref 7\.5%'
+        $html | Should -Match 'href="#t-queues">Queues table</a>'
+        $html | Should -Match 'class="totop"'
+        $html | Should -Match 'data-open="1"'
+        $html | Should -Match 'Reference thresholds: abandon 7\.5%'
+    }
+
+    It 'collapses drill-down tables, opens short aggregates, and caps long tables at 25 visible rows' {
+        $report = Get-ConversationReport -Profiles $script:layoutProfiles -Lookups $script:layoutLookups -Source 'test' -QueryInterval ''
+        $html = ConvertTo-ConversationReportHtml -Report $report
+        $html | Should -Match '<details class="tbl" id="t-queues" open>'
+        $html | Should -Match '<details class="tbl" id="t-agents"><summary>'
+        $html | Should -Match '<details class="tbl" id="t-longest"><summary>'
+        $html | Should -Match '<span class="tier">drill-down</span>'
+        # 30 distinct wrap-up codes: the table starts collapsed, shows 25 rows and offers the rest.
+        $many = 1..30 | ForEach-Object {
+            $c = New-TestConversation -Id "wrap-$_"
+            $c.participants[3].sessions[0].segments[0] | Add-Member -NotePropertyName wrapUpCode -NotePropertyValue "code-$_"
+            Get-ConversationProfile -Conversation $c
+        }
+        $big = ConvertTo-ConversationReportHtml -Report (Get-ConversationReport -Profiles @($many) -Lookups $script:layoutLookups -Source 'test' -QueryInterval '')
+        $big | Should -Match '<details class="tbl" id="t-wrap-up-codes"><summary>'
+        ([regex]::Matches($big, '<tr class="x">')).Count | Should -Be 5
+        $big | Should -Match 'Show all 30 rows'
+    }
+
+    It 'hides the breakdown tables in print so the PDF is the executive brief' {
+        $report = Get-ConversationReport -Profiles $script:layoutProfiles -Lookups $script:layoutLookups -Source 'test' -QueryInterval ''
+        $html = ConvertTo-ConversationReportHtml -Report $report
+        $print = [regex]::Match($html, '@media print \{(?<body>.*?)\n\}', 'Singleline').Groups['body'].Value
+        $print | Should -Match '#tables'
+        $print | Should -Match 'display:none'
+        $print | Should -Match '\.print-only \{ display:block; \}'
+        $html | Should -Match 'Executive brief'
+    }
+}
