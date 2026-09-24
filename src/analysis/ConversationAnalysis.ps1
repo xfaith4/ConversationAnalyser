@@ -187,7 +187,7 @@ function ConvertFrom-IntervalString {
 
 function Get-ConversationIntervalCoverage {
     # Compares each conversation's conversationStart with the requested query interval.
-    # The details job matches any conversation with a segment inside the interval, so long-lived
+    # The details query matches any conversation with a segment inside the interval, so long-lived
     # conversations (email, messaging, callbacks) can start well before it; this makes that visible.
     param(
         [AllowNull()][object[]]$Conversations,

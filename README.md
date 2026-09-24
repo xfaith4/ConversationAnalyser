@@ -1,9 +1,9 @@
 # ConversationAnalyser
 
-WPF tool for Genesys Cloud conversation detail analytics. It submits an async
-`/api/v2/analytics/conversations/details/jobs` query, collects every page of results,
-and presents them as a per-conversation grid, a drill-down detail panel, and a
-collection-level report. The Campaign Analysis tab adds outbound campaign lookup, live
+WPF tool for Genesys Cloud conversation detail analytics. It runs a paged
+`POST /api/v2/analytics/conversations/details/query`, collects every page of results
+with live progress, and presents them as a per-conversation grid, a drill-down detail
+panel, and a collection-level report. The Campaign Analysis tab adds outbound campaign lookup, live
 status, rules, and events, and feeds a campaign straight into the conversation query.
 
 ## Files
@@ -13,10 +13,12 @@ status, rules, and events, and feeds a campaign straight into the conversation q
 - `src/ui/UiApiRetry.ps1` - retry/backoff helper used by the app
 - `src/analysis/ConversationAnalysis.ps1` - field extraction, flat rows, report aggregation, and HTML/JSON rendering (no UI or network code)
 - `src/campaign/CampaignAnalysis.ps1` - campaign list, status snapshot, rules, and events for the Campaign Analysis tab (no UI or network code; takes a request callback)
+- `src/query/ConversationDetailQuery.ps1` - paged conversation detail query: 7-day window splitting, pageSize/pageNumber paging, de-duplication, client-side start-of-day filter (no UI or network code; takes a request callback)
 - `GenesysConvAnalyzer.config.example.json` - template for the per-machine config file
 - `tests/PkceAuth.Tests.ps1` - Pester tests for the PKCE helpers
 - `tests/ConversationAnalysis.Tests.ps1` - Pester tests for the analysis helpers
 - `tests/CampaignAnalysis.Tests.ps1` - Pester tests for the campaign module (fake API, no network)
+- `tests/ConversationDetailQuery.Tests.ps1` - Pester tests for the paged query module (fake API, no network)
 
 ## Run
 
@@ -80,7 +82,35 @@ startup.
 Invoke-Pester -Path .\tests\PkceAuth.Tests.ps1 -Output Detailed
 Invoke-Pester -Path .\tests\ConversationAnalysis.Tests.ps1 -Output Detailed
 Invoke-Pester -Path .\tests\CampaignAnalysis.Tests.ps1 -Output Detailed
+Invoke-Pester -Path .\tests\ConversationDetailQuery.Tests.ps1 -Output Detailed
 ```
+
+## Running a query
+
+1. Build the request in the **Query Builder** (interval, quick filters, conversation and
+   segment filters) and click **Preview Request** to see the endpoint, the first page body
+   exactly as it will be sent, and the execution plan.
+2. Click **Run Query**. The app switches to the **Query Monitor** tab and pages through
+   the results on the spot: the header shows the interval, state, current window, pages
+   read, distinct conversations loaded, and elapsed time; every page is logged.
+3. The **Results** tab opens automatically when the query finishes. **Stop Query** ends a
+   run after the page in flight and keeps what was already received; **Show Results**
+   reopens the Results tab for whatever is loaded.
+
+How the paged query works:
+
+- The endpoint returns pages of at most 100 conversations (`paging.pageSize` /
+  `paging.pageNumber`) and reports `totalHits`. Paging stops on a short page, when
+  `totalHits` is reached, or at the safety cap of 1,000 page requests per run.
+- One query may cover at most 7 days, so a longer interval is split into consecutive 7-day
+  windows that are queried one after another. A conversation with activity in two adjacent
+  windows is returned by both and merged by `conversationId`; the log reports how many
+  duplicates were removed. Descending queries walk the windows newest-first so the merged
+  result keeps the requested order.
+- The details query POST is read-only, so transient 429/5xx responses are retried with
+  the same backoff as GET calls (`Retry-After` is honored and every retry is logged).
+- A request failure keeps the pages already loaded and shows them as partial results; the
+  report header says which page failed.
 
 Works in Windows PowerShell 5.1 and PowerShell 7+.
 
@@ -89,18 +119,19 @@ Works in Windows PowerShell 5.1 and PowerShell 7+.
 - **Dates and times are entered in US Eastern** (business HQ), whatever time zone the
   machine runs in. The app converts them to UTC, which is what Genesys Cloud stores for
   `conversationStart` and `conversationEnd`, and shows the exact UTC interval it will send
-  under the pickers after **Preview** or **Submit**. Daylight saving is handled per date
+  under the pickers after **Preview** or **Run Query**. Daylight saving is handled per date
   (EDT/EST); a start time that falls in the spring-forward gap is moved forward one hour.
   The presets (Today, Yesterday, Last 7 Days, ...) also use the Eastern calendar date.
-- **startOfDayIntervalMatching** (checkbox, on by default) sends
-  `"startOfDayIntervalMatching": true` with the job. The details job otherwise matches any
-  conversation that has a segment inside the interval, so long-lived email, message, and
-  callback conversations that started days or weeks earlier are returned too. With the flag
-  on, only conversations whose `conversationStart` is on or after 00:00 UTC of the interval
-  start date are included. Note that the cut-off is the start *date* in UTC, not the exact
+- **startOfDayIntervalMatching** (checkbox, on by default) is applied client-side: the
+  details query endpoint has no such option and otherwise matches any conversation that
+  has a segment inside the interval, so long-lived email, message, and callback
+  conversations that started days or weeks earlier are returned too. With the box ticked,
+  conversations whose `conversationStart` is before 00:00 UTC of the interval start date
+  are dropped as each page arrives (the same rule the async job applied) and the log says
+  how many were removed. Note that the cut-off is the start *date* in UTC, not the exact
   start time, so a few conversations from the hours just before the interval can still
-  appear; the interval check in the Job Monitor makes that visible.
-- **Interval check**: after every collection the Job Monitor logs how many conversations
+  appear; the interval check in the Query Monitor makes that visible.
+- **Interval check**: after every query the Query Monitor logs how many conversations
   started inside, before, or after the requested interval, plus the earliest and latest
   `conversationStart` in UTC and Eastern. Nothing is dropped; the numbers are there so a
   result set that reaches back beyond the interval is obvious at once.
@@ -115,8 +146,8 @@ Works in Windows PowerShell 5.1 and PowerShell 7+.
   resolves the agents present in the loaded data in batches of 50 via
   `GET /api/v2/users?id=...&state=any` (only users who appear in the conversations are
   fetched; inactive and deleted users still resolve).
-  This also runs automatically after a collection when you are authenticated. Any lookup
-  that fails (for example, a missing permission) is logged in the Job Monitor and the raw
+  This also runs automatically after a query when you are authenticated. Any lookup
+  that fails (for example, a missing permission) is logged in the Query Monitor and the raw
   ID is shown instead.
 - **Detail panel** (drag the splitter to resize):
   - Overview: outcome, queue/agent path, wrap-up, who disconnected, ANI/DNIS, flow, timings, MOS, evaluations, surveys
@@ -184,7 +215,7 @@ itself is entered in US Eastern; see the Query Builder section).
 ## Campaign Analysis tab
 
 Investigate one outbound campaign without leaving the app. Sign in first: every call uses
-the same token, retry policy, and Job Monitor logging as the analytics job.
+the same token, retry policy, and Query Monitor logging as the analytics query.
 
 1. **Load Campaigns** reads every voice, SMS, and email campaign in the org
    (`GET /api/v2/outbound/campaigns/all`). Type in the box next to it to filter by name, ID,
@@ -198,7 +229,7 @@ the same token, retry policy, and Job Monitor logging as the analytics job.
      (`/api/v2/outbound/diagnostics/campaigns/{id}/summary`). SMS and email campaigns use
      `/api/v2/outbound/messagingcampaigns/{id}` and its `/progress`; they have no
      diagnostics or stats. A source that fails is listed in red on the Status tab and in
-     the Job Monitor log, and the others still render. Known fields get friendly labels;
+     the Query Monitor log, and the others still render. Known fields get friendly labels;
      anything else the API returns is shown under its raw field name, and the full payload
      is on the Raw JSON tab.
    - **Rules** reads every campaign rule (`/api/v2/outbound/campaignrules`; the API cannot
@@ -211,7 +242,7 @@ the same token, retry policy, and Job Monitor logging as the analytics job.
    - **Analyze Conversations** clears the Query Builder filters, adds one segment filter
      `outboundCampaignId = <id>`, sets the interval (from the campaign's creation date when
      it was created in the last 30 days, otherwise the last 30 days, through today), and
-     shows the request preview. Review the interval, then **Submit Async Job** as usual;
+     shows the request preview. Review the interval, then **Run Query** as usual;
      Results and Report then describe that campaign's conversations.
    - **Copy ID** puts the campaign ID on the clipboard.
 
@@ -220,16 +251,16 @@ The segment filter dimension list in the Query Builder also offers `outboundCamp
 
 ## Required permissions
 
-- Analytics conversation detail jobs (existing requirement).
+- Conversation detail query (`analytics:conversationDetail:view`).
 - Optional, for name resolution: read access to routing queues (`routing:queue:view`),
   wrap-up codes (`routing:wrapupCode:view`), skills, languages, and divisions. Missing
-  access only affects that lookup type; the Job Monitor log shows which call failed.
+  access only affects that lookup type; the Query Monitor log shows which call failed.
 - Campaign Analysis tab: campaign view (`outbound:campaign:view`) for the list,
   configuration, progress, diagnostics, and stats; messaging campaign view
   (`outbound:messagingCampaign:view`) for SMS and email campaigns; campaign rule view
   (`outbound:campaignRule:view`) for Rules; and outbound event log view
   (`outbound:eventLog:view`) for Recent Events. A missing permission fails only that call
-  and is logged in the Job Monitor.
+  and is logged in the Query Monitor.
 
 ## Notes
 
