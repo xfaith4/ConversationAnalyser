@@ -650,7 +650,8 @@ function Get-CampaignEventRows {
 function Get-CampaignAnalysisInterval {
     # Default query window for a campaign's conversations: from the campaign's creation date when
     # it was created within the last MaxDays days, otherwise the last MaxDays days; through today.
-    param([Parameter(Mandatory)][object]$Campaign, [DateTime]$Today = [DateTime]::Today, [int]$MaxDays = 30)
+    # Calendar dates are taken in TimeZone (the caller passes the business zone; default is the machine's).
+    param([Parameter(Mandatory)][object]$Campaign, [DateTime]$Today = [DateTime]::Today, [int]$MaxDays = 30, [TimeZoneInfo]$TimeZone = [TimeZoneInfo]::Local)
     $floor = $Today.AddDays(-($MaxDays - 1))
     $start = $floor
     $reason = "last $MaxDays days"
@@ -658,7 +659,7 @@ function Get-CampaignAnalysisInterval {
     if ([string]::IsNullOrWhiteSpace($createdText)) { $createdText = [string](Get-CampaignProperty -Object $Campaign -Name 'Created') }
     $created = [DateTime]::MinValue
     if (-not [string]::IsNullOrWhiteSpace($createdText) -and [DateTime]::TryParse($createdText, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$created)) {
-        $createdDate = if ($created.Kind -eq [DateTimeKind]::Unspecified) { $created.Date } else { $created.ToLocalTime().Date }
+        $createdDate = if ($created.Kind -eq [DateTimeKind]::Unspecified) { $created.Date } else { [TimeZoneInfo]::ConvertTimeFromUtc($created.ToUniversalTime(), $TimeZone).Date }
         if ($createdDate -gt $floor -and $createdDate -le $Today) { $start = $createdDate; $reason = 'since campaign creation' }
     }
     return [pscustomobject]@{

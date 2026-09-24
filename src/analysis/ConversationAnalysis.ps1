@@ -40,6 +40,12 @@ foreach ($name in @('nOffered', 'tAnswered', 'tAbandon', 'tShortAbandon', 'nOver
         'tHandle', 'tTalk', 'tHeld', 'tAcw', 'tAlert', 'tNotResponding', 'nTransferred', 'nOutbound')) { $script:caSessionMetricNames[$name] = $true }
 
 $script:caBarChar = [string][char]0x2588
+# Disconnect types that mean the platform, not a person, ended the leg.
+$script:caPlatformDisconnectTypes = @('system', 'error', 'timeout', 'transport.failure')
+# Tables that are drill-down lists rather than aggregates: always collapsed in the HTML report.
+$script:caDrillDownTables = @('Agents', 'Longest', 'Lowest MOS', 'Error Conversations')
+$script:caReportOpenRowLimit = 15     # aggregate tables with more rows than this start collapsed
+$script:caReportVisibleRowLimit = 25  # rows shown before the "show all" control
 
 # Plain-language meaning for segment error codes that matter operationally. Exact codes first,
 # then family prefixes. Full list: https://help.genesys.cloud/articles/error-codes/
@@ -109,6 +115,113 @@ function ConvertTo-UtcDateTime {
     return $null
 }
 
+# -----------------------------------------------------------------------------
+# Business time zone (US Eastern, where HQ is located)
+# -----------------------------------------------------------------------------
+# Query intervals are typed as Eastern wall-clock times and sent to the platform in UTC,
+# which is what Genesys Cloud stores for conversationStart / conversationEnd. These helpers
+# make that conversion independent of the time zone of the machine running the app.
+
+$script:caBusinessTimeZoneIds = @('Eastern Standard Time', 'America/New_York')
+$script:caBusinessTimeZone = $null
+
+function Get-BusinessTimeZone {
+    # Windows id first, IANA id as the fallback on non-Windows hosts. Cached after first use.
+    if ($null -ne $script:caBusinessTimeZone) { return $script:caBusinessTimeZone }
+    foreach ($id in $script:caBusinessTimeZoneIds) {
+        try {
+            $script:caBusinessTimeZone = [TimeZoneInfo]::FindSystemTimeZoneById($id)
+            return $script:caBusinessTimeZone
+        }
+        catch { }
+    }
+    throw "US Eastern time zone not found on this host (tried: $($script:caBusinessTimeZoneIds -join ', '))."
+}
+
+function ConvertFrom-BusinessTime {
+    # Eastern wall-clock time -> UTC. The Kind of the input is ignored: the value is always read
+    # as Eastern. A time inside the spring-forward gap is moved forward one hour; an ambiguous
+    # fall-back time resolves to standard time (TimeZoneInfo default).
+    param([Parameter(Mandatory = $true)][DateTime]$Value)
+    $tz = Get-BusinessTimeZone
+    $wall = [DateTime]::SpecifyKind($Value, [DateTimeKind]::Unspecified)
+    if ($tz.IsInvalidTime($wall)) { $wall = $wall.AddHours(1) }
+    return [TimeZoneInfo]::ConvertTimeToUtc($wall, $tz)
+}
+
+function ConvertTo-BusinessTime {
+    # UTC -> Eastern wall-clock time (Kind Unspecified). Non-UTC input is normalised first.
+    param([Parameter(Mandatory = $true)][DateTime]$UtcValue)
+    $utc = ConvertTo-UtcDateTime $UtcValue
+    return [TimeZoneInfo]::ConvertTimeFromUtc($utc, (Get-BusinessTimeZone))
+}
+
+function Get-BusinessToday {
+    # Today's date in Eastern time, for date presets and default pickers.
+    return (ConvertTo-BusinessTime ([DateTime]::UtcNow)).Date
+}
+
+function Get-BusinessTimeZoneLabel {
+    # Short label for the UI, e.g. 'US Eastern (EDT, UTC-04:00)' for the given instant.
+    param([DateTime]$UtcValue = [DateTime]::UtcNow)
+    $tz = Get-BusinessTimeZone
+    $utc = ConvertTo-UtcDateTime $UtcValue
+    $abbrev = if ($tz.IsDaylightSavingTime($utc)) { 'EDT' } else { 'EST' }
+    $offset = $tz.GetUtcOffset($utc)
+    $sign = if ($offset -lt [TimeSpan]::Zero) { '-' } else { '+' }
+    return ('US Eastern ({0}, UTC{1}{2:hh\:mm})' -f $abbrev, $sign, $offset.Duration())
+}
+
+function ConvertFrom-IntervalString {
+    # Parses the analytics 'start/end' ISO-8601 interval into UTC DateTimes. Returns $null
+    # when the text is not a two-part interval.
+    param([AllowNull()][string]$Interval)
+    if ([string]::IsNullOrWhiteSpace($Interval)) { return $null }
+    $parts = $Interval.Split('/')
+    if ($parts.Count -ne 2) { return $null }
+    $start = ConvertTo-UtcDateTime $parts[0]
+    $end = ConvertTo-UtcDateTime $parts[1]
+    if ($null -eq $start -or $null -eq $end) { return $null }
+    return [pscustomobject]@{ StartUtc = $start; EndUtc = $end }
+}
+
+function Get-ConversationIntervalCoverage {
+    # Compares each conversation's conversationStart with the requested query interval.
+    # The details query matches any conversation with a segment inside the interval, so long-lived
+    # conversations (email, messaging, callbacks) can start well before it; this makes that visible.
+    param(
+        [AllowNull()][object[]]$Conversations,
+        [Parameter(Mandatory = $true)][string]$Interval
+    )
+    $window = ConvertFrom-IntervalString $Interval
+    if ($null -eq $window) { throw "Interval '$Interval' is not a start/end ISO-8601 interval." }
+
+    $total = 0; $inside = 0; $before = 0; $after = 0; $missing = 0
+    $earliest = $null; $latest = $null
+    foreach ($conv in @($Conversations)) {
+        if ($null -eq $conv) { continue }
+        $total++
+        $start = ConvertTo-UtcDateTime $conv.conversationStart
+        if ($null -eq $start) { $missing++; continue }
+        if ($null -eq $earliest -or $start -lt $earliest) { $earliest = $start }
+        if ($null -eq $latest -or $start -gt $latest) { $latest = $start }
+        if ($start -lt $window.StartUtc) { $before++ }
+        elseif ($start -gt $window.EndUtc) { $after++ }
+        else { $inside++ }
+    }
+    return [pscustomobject]@{
+        StartUtc         = $window.StartUtc
+        EndUtc           = $window.EndUtc
+        Total            = $total
+        Inside           = $inside
+        StartedBefore    = $before
+        StartedAfter     = $after
+        MissingStart     = $missing
+        EarliestStartUtc = $earliest
+        LatestStartUtc   = $latest
+    }
+}
+
 function Format-LocalTimestamp {
     param([AllowNull()][object]$UtcValue, [string]$Format = 'yyyy-MM-dd HH:mm:ss')
     if ($null -eq $UtcValue) { return '' }
@@ -131,6 +244,38 @@ function Get-Percent {
     param([double]$Numerator, [double]$Denominator)
     if ($Denominator -le 0) { return $null }
     return [Math]::Round(100.0 * $Numerator / $Denominator, 1)
+}
+
+function Get-DefaultReportThresholds {
+    # Reference thresholds for observations and the dashboard threshold lines.
+    # Override any key through the config file (reportThresholds) or -Thresholds on Get-ConversationReport.
+    return [ordered]@{
+        AbandonPct          = 5.0    # queue abandon rate at or above this is flagged (percent of offered)
+        WithinSlaPct        = 80.0   # service level below this is flagged (percent of offered)
+        TransferPct         = 15.0   # transferred share of agent-handled conversations
+        PoorMosPct          = 2.0    # share of MOS-scored conversations below 3.5
+        NotResponding       = 5      # unanswered alerts per agent
+        SystemDisconnectPct = 5.0    # conversations ended by system/error/timeout, percent of all
+    }
+}
+
+function Resolve-ReportThresholds {
+    # Merges caller overrides (hashtable or PSCustomObject, e.g. from JSON) over the defaults.
+    # Unknown keys are ignored; non-numeric values keep the default.
+    param([object]$Overrides)
+    $resolved = Get-DefaultReportThresholds
+    if ($null -eq $Overrides) { return $resolved }
+    $pairs = if ($Overrides -is [System.Collections.IDictionary]) { $Overrides.GetEnumerator() | ForEach-Object { @{ Key = $_.Key; Value = $_.Value } } }
+    else { $Overrides.PSObject.Properties | ForEach-Object { @{ Key = $_.Name; Value = $_.Value } } }
+    foreach ($pair in @($pairs)) {
+        $key = @($resolved.Keys | Where-Object { $_ -ieq [string]$pair.Key })
+        if ($key.Count -eq 0) { continue }
+        $number = 0.0
+        if ([double]::TryParse([string]$pair.Value, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$number)) {
+            $resolved[$key[0]] = if ($key[0] -eq 'NotResponding') { [int][Math]::Round($number) } else { [Math]::Round($number, 1) }
+        }
+    }
+    return $resolved
 }
 
 function Get-NearestRankPercentile {
@@ -1166,8 +1311,10 @@ function Get-ConversationReport {
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Profiles,
         [hashtable]$Lookups,
         [string]$Source = '',
-        [string]$QueryInterval = ''
+        [string]$QueryInterval = '',
+        [object]$Thresholds = $null
     )
+    $t = Resolve-ReportThresholds -Overrides $Thresholds
 
     # Conversation-level group layout (hour, date, media, wrap-up, disconnect, flow)
     $gConv = 0; $gOffered = 1; $gAnswered = 2; $gAsa = 3; $gAbandoned = 5; $gConnected = 6; $gTransferred = 7
@@ -1643,33 +1790,35 @@ function Get-ConversationReport {
     # -- Observations (rule-based, with the reference threshold stated in each line)
     $observations = [System.Collections.Generic.List[string]]::new()
     $queueRows = @($tables['Queues'].Rows)
-    if ($null -ne $abandonPct -and $abandonPct -ge 5) {
+    if ($null -ne $abandonPct -and $abandonPct -ge $t.AbandonPct) {
         $worst = @($queueRows | Where-Object { $_.Offered -ge 10 -and $null -ne $_.AbandonPct } | Sort-Object AbandonPct -Descending | Select-Object -First 1)
         $suffix = if ($worst.Count -gt 0) { " Highest: $($worst[0].Queue) at $($worst[0].AbandonPct)% of $($worst[0].Offered) offered." } else { '' }
-        $observations.Add("Abandon rate is $abandonPct% ($abandoned of $offered offered), above the 5% reference threshold.$suffix") | Out-Null
+        $observations.Add("Abandon rate is $abandonPct% ($abandoned of $offered offered), above the $($t.AbandonPct)% reference threshold.$suffix") | Out-Null
     }
-    if ($null -ne $slaPct -and $slaPct -lt 80) {
-        $observations.Add("Only $slaPct% of queue offers were handled within service level (80% reference).") | Out-Null
+    if ($null -ne $slaPct -and $slaPct -lt $t.WithinSlaPct) {
+        $observations.Add("Only $slaPct% of queue offers were handled within service level ($($t.WithinSlaPct)% reference).") | Out-Null
     }
-    if ($null -ne $transferPct -and $transferPct -ge 15) {
-        $observations.Add("$transferPct% of agent-handled conversations were transferred (15% reference). Review the Queues and Wrap-up Codes tables for routing fit.") | Out-Null
+    if ($null -ne $transferPct -and $transferPct -ge $t.TransferPct) {
+        $observations.Add("$transferPct% of agent-handled conversations were transferred ($($t.TransferPct)% reference). Review the Queues and Wrap-up Codes tables for routing fit.") | Out-Null
     }
-    if ($null -ne $poorMosPct -and $poorMosPct -ge 2) {
-        $observations.Add("$poorMosPct% of conversations with MOS data scored below 3.5 (2% reference). See the Lowest MOS table for the affected conversations.") | Out-Null
+    if ($null -ne $poorMosPct -and $poorMosPct -ge $t.PoorMosPct) {
+        $observations.Add("$poorMosPct% of conversations with MOS data scored below 3.5 ($($t.PoorMosPct)% reference). See the Lowest MOS table for the affected conversations.") | Out-Null
     }
     $slowQueue = @($queueRows | Where-Object { $_.Handled -ge 10 -and $null -ne $_.AhtSec } | Sort-Object AhtSec -Descending | Select-Object -First 1)
     if ($slowQueue.Count -gt 0 -and $queueRows.Count -gt 1) {
         $observations.Add("Longest average handle time: $($slowQueue[0].Queue) at $(Format-SecondsDisplay $slowQueue[0].AhtSec) across $($slowQueue[0].Handled) handled conversations.") | Out-Null
     }
-    $missedAgent = @($tables['Agents'].Rows | Where-Object { $_.NotResponding -ge 5 } | Sort-Object NotResponding -Descending | Select-Object -First 1)
+    $missedAgent = @($tables['Agents'].Rows | Where-Object { $_.NotResponding -ge $t.NotResponding } | Sort-Object NotResponding -Descending | Select-Object -First 1)
     if ($missedAgent.Count -gt 0) {
-        $observations.Add("Most unanswered alerts: $($missedAgent[0].Agent) with $($missedAgent[0].NotResponding) (tNotResponding; 5 reference). Check presence and alerting-timeout settings.") | Out-Null
+        $missedCount = @($tables['Agents'].Rows | Where-Object { $_.NotResponding -ge $t.NotResponding }).Count
+        $others = if ($missedCount -gt 1) { " $missedCount agents are at or over the reference." } else { '' }
+        $observations.Add("Most unanswered alerts: $($missedAgent[0].Agent) with $($missedAgent[0].NotResponding) (tNotResponding; $($t.NotResponding) reference).$others Check presence and alerting-timeout settings.") | Out-Null
     }
     $systemEnds = 0
-    foreach ($row in $tables['Disconnects'].Rows) { if ($row.DisconnectType -in @('system', 'error', 'timeout', 'transport.failure')) { $systemEnds += $row.Conversations } }
+    foreach ($row in $tables['Disconnects'].Rows) { if ($row.DisconnectType -in $script:caPlatformDisconnectTypes) { $systemEnds += $row.Conversations } }
     $systemPct = Get-Percent $systemEnds $total
-    if ($null -ne $systemPct -and $systemPct -ge 5) {
-        $observations.Add("$systemPct% of conversations ended with a system, error, or timeout disconnect (5% reference).") | Out-Null
+    if ($null -ne $systemPct -and $systemPct -ge $t.SystemDisconnectPct) {
+        $observations.Add("$systemPct% of conversations ended with a system, error, or timeout disconnect ($($t.SystemDisconnectPct)% reference).") | Out-Null
     }
     if ($errorItems.Count -gt 0) {
         $errorPct = Get-Percent $errorItems.Count $total
@@ -1712,6 +1861,7 @@ function Get-ConversationReport {
         Units             = 'Durations in seconds (display adds m:ss); percentages 0-100; MOS on a 1-5 scale; times in local time.'
         Kpis              = @($kpis)
         Observations      = @($observations)
+        Thresholds        = $t
         Tables            = $tables
     }
 }
@@ -1734,42 +1884,330 @@ function ConvertTo-ReportHeaderText {
     return $words + $suffix
 }
 
+# -----------------------------------------------------------------------------
+# Dashboard charts (inline SVG; the report stays a single self-contained file)
+# -----------------------------------------------------------------------------
+
+function ConvertTo-SvgNumber {
+    param([double]$Value, [int]$Digits = 1)
+    return [Math]::Round($Value, $Digits).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function ConvertTo-SvgText {
+    param([object]$Value)
+    return [System.Security.SecurityElement]::Escape([string]$Value)
+}
+
+function ConvertTo-SvgLabel {
+    # Keeps the tail of long labels: the discriminating part of an error code or queue name is at the end.
+    param([string]$Text, [int]$MaxLength = 34)
+    if ([string]::IsNullOrEmpty($Text) -or $Text.Length -le $MaxLength) { return $Text }
+    return [string][char]0x2026 + $Text.Substring($Text.Length - ($MaxLength - 1))
+}
+
+function New-ReportTrendSvg {
+    # Two stacked panels on one x axis: bars for a count on top, a line for a rate below with a dashed
+    # reference line. Two panels rather than a dual-axis chart so each panel keeps one honest scale.
+    param(
+        [string[]]$Labels,
+        [double[]]$BarValues,
+        [object[]]$LineValues,
+        [string[]]$Tooltips,
+        [string]$BarName,
+        [string]$LineName,
+        [object]$Threshold
+    )
+    $n = $Labels.Count
+    if ($n -eq 0) { return '' }
+    $f = { param($v, $d = 1) ConvertTo-SvgNumber -Value $v -Digits $d }
+    $w = 660; $left = 48; $right = 14; $plotW = $w - $left - $right
+    $barTop = 16; $barH = 120; $lineTop = $barTop + $barH + 40; $lineH = 96; $h = $lineTop + $lineH + 26
+    $slot = $plotW / $n; $barW = [Math]::Max(1.0, [Math]::Min($slot * 0.72, 40))
+    $maxBar = 1.0; foreach ($v in $BarValues) { if ($v -gt $maxBar) { $maxBar = $v } }
+    $maxLine = 1.0; foreach ($v in $LineValues) { if ($null -ne $v -and [double]$v -gt $maxLine) { $maxLine = [double]$v } }
+    $ref = if ($null -ne $Threshold) { [double]$Threshold } else { $null }
+    if ($null -ne $ref -and $ref * 1.15 -gt $maxLine) { $maxLine = $ref * 1.15 }
+
+    $sb = [System.Text.StringBuilder]::new()
+    $null = $sb.Append("<svg viewBox=""0 0 $w $h"" role=""img"" aria-label=""$(ConvertTo-SvgText "$BarName; $LineName")"">")
+    $null = $sb.Append("<text class=""ptitle"" x=""$left"" y=""$($barTop - 5)"">$(ConvertTo-SvgText $BarName)</text>")
+    $null = $sb.Append("<text class=""ptitle"" x=""$left"" y=""$($lineTop - 7)"">$(ConvertTo-SvgText $LineName)</text>")
+    foreach ($panel in @(@{ Top = $barTop; H = $barH; Max = $maxBar; Suffix = ''; Digits = 0 }, @{ Top = $lineTop; H = $lineH; Max = $maxLine; Suffix = '%'; Digits = 1 })) {
+        foreach ($frac in @(0.0, 0.5, 1.0)) {
+            $y = $panel.Top + $panel.H - $frac * $panel.H
+            $null = $sb.Append("<line class=""grid"" x1=""$left"" x2=""$($w - $right)"" y1=""$(& $f $y)"" y2=""$(& $f $y)""/>")
+            $null = $sb.Append("<text class=""yl"" x=""$($left - 6)"" y=""$(& $f ($y + 4))"">$(& $f ($panel.Max * $frac) $panel.Digits)$($panel.Suffix)</text>")
+        }
+    }
+    for ($i = 0; $i -lt $n; $i++) {
+        $x = $left + $i * $slot + ($slot - $barW) / 2
+        $bh = $barH * $BarValues[$i] / $maxBar
+        $y = $barTop + $barH - $bh
+        $null = $sb.Append("<rect class=""bar"" x=""$(& $f $x)"" y=""$(& $f $y)"" width=""$(& $f $barW)"" height=""$(& $f $bh)"" rx=""2""><title>$(ConvertTo-SvgText $Tooltips[$i])</title></rect>")
+    }
+    if ($null -ne $ref) {
+        $ty = $lineTop + $lineH - $lineH * $ref / $maxLine
+        $null = $sb.Append("<line class=""ref"" x1=""$left"" x2=""$($w - $right)"" y1=""$(& $f $ty)"" y2=""$(& $f $ty)""/>")
+        $null = $sb.Append("<text class=""rl"" x=""$($w - $right)"" y=""$(& $f ($ty - 4))"">ref $(& $f $ref)%</text>")
+    }
+    $path = [System.Text.StringBuilder]::new(); $dots = [System.Text.StringBuilder]::new(); $pen = $false
+    for ($i = 0; $i -lt $n; $i++) {
+        $v = $LineValues[$i]
+        if ($null -eq $v) { $pen = $false; continue }
+        $cx = $left + $i * $slot + $slot / 2
+        $cy = $lineTop + $lineH - $lineH * [double]$v / $maxLine
+        $null = $path.Append("$(if ($pen) { 'L' } else { 'M' })$(& $f $cx) $(& $f $cy) ")
+        $pen = $true
+        $hot = if ($null -ne $ref -and [double]$v -ge $ref) { ' hot' } else { '' }
+        $null = $dots.Append("<circle class=""dot$hot"" cx=""$(& $f $cx)"" cy=""$(& $f $cy)"" r=""3.5""><title>$(ConvertTo-SvgText $Tooltips[$i])</title></circle>")
+    }
+    if ($path.Length -gt 0) { $null = $sb.Append("<path class=""line"" d=""$($path.ToString().Trim())""/>") }
+    $null = $sb.Append($dots.ToString())
+    $step = [Math]::Max(1, [int][Math]::Ceiling($n / 12.0))
+    for ($i = 0; $i -lt $n; $i += $step) {
+        $cx = $left + $i * $slot + $slot / 2
+        $null = $sb.Append("<text class=""xl"" x=""$(& $f $cx)"" y=""$($h - 8)"">$(ConvertTo-SvgText $Labels[$i])</text>")
+    }
+    $null = $sb.Append('</svg>')
+    return $sb.ToString()
+}
+
+function New-ReportBarsSvg {
+    # Horizontal bars, one row per item. Flagged rows use the status colour plus a marker glyph in the
+    # value label, so the flag never relies on colour alone.
+    param(
+        [object[]]$Items,
+        [object]$Threshold,
+        [string]$ValueSuffix = ''
+    )
+    $n = $Items.Count
+    if ($n -eq 0) { return '' }
+    $f = { param($v, $d = 1) ConvertTo-SvgNumber -Value $v -Digits $d }
+    $w = 580; $labelW = 216; $left = $labelW + 8; $right = 92; $rowH = 22; $top = 6
+    $plotW = $w - $left - $right
+    $ref = if ($null -ne $Threshold) { [double]$Threshold } else { $null }
+    $h = $top + $n * $rowH + $(if ($null -ne $ref) { 20 } else { 8 })
+    $max = 1.0; foreach ($item in $Items) { if ([double]$item.Value -gt $max) { $max = [double]$item.Value } }
+    if ($null -ne $ref -and $ref -gt $max) { $max = $ref * 1.1 }
+
+    $sb = [System.Text.StringBuilder]::new()
+    $null = $sb.Append("<svg viewBox=""0 0 $w $h"" role=""img"">")
+    for ($i = 0; $i -lt $n; $i++) {
+        $item = $Items[$i]
+        $y = $top + $i * $rowH
+        $bw = $plotW * [double]$item.Value / $max
+        $hot = if ($item.Highlight) { ' hot' } else { '' }
+        $marker = if ($item.Highlight) { ' ' + [string][char]0x25B2 } else { '' }
+        $null = $sb.Append("<text class=""bl"" x=""$labelW"" y=""$($y + 15)""><title>$(ConvertTo-SvgText $item.Label)</title>$(ConvertTo-SvgText (ConvertTo-SvgLabel -Text $item.Label -MaxLength 38))</text>")
+        $null = $sb.Append("<rect class=""bar$hot"" x=""$left"" y=""$($y + 4)"" width=""$(& $f $bw)"" height=""14"" rx=""2""><title>$(ConvertTo-SvgText $item.Tooltip)</title></rect>")
+        $null = $sb.Append("<text class=""vl"" x=""$(& $f ($left + $bw + 6))"" y=""$($y + 15)"">$(ConvertTo-SvgText "$($item.Display)$marker")</text>")
+    }
+    if ($null -ne $ref) {
+        $x = $left + $plotW * $ref / $max
+        $bottom = $top + $n * $rowH
+        $null = $sb.Append("<line class=""ref"" x1=""$(& $f $x)"" x2=""$(& $f $x)"" y1=""$top"" y2=""$bottom""/>")
+        $null = $sb.Append("<text class=""xl"" x=""$(& $f $x)"" y=""$($bottom + 12)"">ref $(& $f $ref)$ValueSuffix</text>")
+    }
+    $null = $sb.Append('</svg>')
+    return $sb.ToString()
+}
+
+function Get-ReportChartSet {
+    # The dashboard: trends first, then the platform smoke detectors. Each entry names the table that
+    # holds its evidence. Entries with an empty Svg render their Note only (an absent signal is a finding).
+    param([Parameter(Mandatory = $true)][object]$Report)
+    $t = if ($null -ne $Report.PSObject.Properties['Thresholds'] -and $null -ne $Report.Thresholds) { $Report.Thresholds } else { Get-DefaultReportThresholds }
+    $charts = [System.Collections.Generic.List[object]]::new()
+    $add = { param($title, $table, $note, $svg) $charts.Add([pscustomobject]@{ Title = $title; Table = $table; Note = $note; Svg = $svg }) | Out-Null }
+    $pct = { param($v) if ($null -eq $v) { 'n/a' } else { "$v%" } }
+
+    foreach ($spec in @(
+            @{ Table = 'Daily'; Title = 'Daily trend'; Label = { param($r) $r.Date.Substring(5) }; Prefix = { param($r) "$($r.Date) ($($r.Day))" }; Unit = 'day' },
+            @{ Table = 'Hourly'; Title = 'Hourly trend'; Label = { param($r) $r.Hour }; Prefix = { param($r) $r.Hour }; Unit = 'hour' })) {
+        $rows = @($Report.Tables[$spec.Table].Rows)
+        if ($rows.Count -lt 2) { continue }
+        $labels = [System.Collections.Generic.List[string]]::new(); $bars = [System.Collections.Generic.List[double]]::new()
+        $lines = [System.Collections.Generic.List[object]]::new(); $tips = [System.Collections.Generic.List[string]]::new()
+        foreach ($r in $rows) {
+            $labels.Add([string](& $spec.Label $r)); $bars.Add([double]$r.Conversations); $lines.Add($r.AbandonPct)
+            $tips.Add("$(& $spec.Prefix $r): $($r.Conversations) conversations, $($r.Abandoned) abandoned ($(& $pct $r.AbandonPct))")
+        }
+        $svg = New-ReportTrendSvg -Labels $labels.ToArray() -BarValues $bars.ToArray() -LineValues $lines.ToArray() -Tooltips $tips.ToArray() `
+            -BarName "Conversations per $($spec.Unit)" -LineName "Abandon % per $($spec.Unit)" -Threshold $t.AbandonPct
+        & $add $spec.Title $spec.Table "Abandon reference $($t.AbandonPct)%; points at or over it are flagged." $svg
+    }
+
+    $items = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in @($Report.Tables['Disconnects'].Rows | Select-Object -First 12)) {
+        $label = "$($r.DisconnectedBy) / $($r.DisconnectType)"
+        $items.Add([pscustomobject]@{
+                Label = $label; Value = [double]$r.Conversations; Display = "$($r.Conversations) ($(& $pct $r.SharePct))"
+                Highlight = ($r.DisconnectType -in $script:caPlatformDisconnectTypes)
+                Tooltip = "$label`: $($r.Conversations) conversations ($(& $pct $r.SharePct)); $($r.Answered) answered, $($r.Abandoned) abandoned"
+            }) | Out-Null
+    }
+    $svg = New-ReportBarsSvg -Items $items.ToArray()
+    $note = if ($items.Count -gt 0) { [string][char]0x25B2 + " platform-side ends (system, error, timeout, transport). Reference $($t.SystemDisconnectPct)% of conversations." } else { 'No disconnect data in this window.' }
+    & $add 'Disconnect reasons' 'Disconnects' $note $svg
+
+    $items.Clear()
+    foreach ($r in @($Report.Tables['Error Codes'].Rows | Select-Object -First 10)) {
+        $meaning = if ($r.Meaning) { " $($r.Meaning)" } else { '' }
+        $items.Add([pscustomobject]@{
+                Label = ($r.ErrorCode -replace '^error\.', ''); Value = [double]$r.Conversations; Display = "$($r.Conversations) ($(& $pct $r.SharePct))"
+                Highlight = ($r.ErrorCode -like '*.webrtc.endpoint.disconnect.*')
+                Tooltip = "$($r.ErrorCode): $($r.Conversations) conversations ($(& $pct $r.SharePct)), $($r.Segments) segments; carried by $($r.Purposes); ended $($r.DisconnectTypes).$meaning"
+            }) | Out-Null
+    }
+    $svg = New-ReportBarsSvg -Items $items.ToArray()
+    $note = if ($items.Count -gt 0) { [string][char]0x25B2 + ' agent WebRTC phone drops. Hover for the full code and meaning; the Error Codes table lists every code.' } else { 'No segment error codes in this window.' }
+    & $add 'Segment error codes' 'Error Codes' $note $svg
+
+    $items.Clear()
+    foreach ($r in @($Report.Tables['Queues'].Rows | Where-Object { $_.Offered -ge 1 -and $null -ne $_.AbandonPct } | Sort-Object -Property @{ Expression = 'AbandonPct'; Descending = $true }, @{ Expression = 'Offered'; Descending = $true } | Select-Object -First 10)) {
+        $items.Add([pscustomobject]@{
+                Label = $r.Queue; Value = [double]$r.AbandonPct; Display = "$($r.AbandonPct)% of $($r.Offered)"
+                Highlight = ([double]$r.AbandonPct -ge [double]$t.AbandonPct)
+                Tooltip = "$($r.Queue): $($r.Abandoned) of $($r.Offered) offered abandoned ($($r.AbandonPct)%); $($r.ShortAbandons) short abandons; avg abandon wait $($r.AvgAbandonWaitSec)s"
+            }) | Out-Null
+    }
+    $svg = New-ReportBarsSvg -Items $items.ToArray() -Threshold $t.AbandonPct -ValueSuffix '%'
+    $note = if ($items.Count -gt 0) { "Top 10 queues by abandon rate; $([string][char]0x25B2) at or over the $($t.AbandonPct)% reference." } else { 'No queue offers in this window.' }
+    & $add 'Queue abandon rate' 'Queues' $note $svg
+
+    $items.Clear()
+    foreach ($r in @($Report.Tables['Agents'].Rows | Where-Object { $_.NotResponding -gt 0 } | Sort-Object -Property @{ Expression = 'NotResponding'; Descending = $true }, @{ Expression = 'Conversations'; Descending = $true } | Select-Object -First 10)) {
+        $items.Add([pscustomobject]@{
+                Label = $r.Agent; Value = [double]$r.NotResponding; Display = "$($r.NotResponding) of $($r.Conversations)"
+                Highlight = ([int]$r.NotResponding -ge [int]$t.NotResponding)
+                Tooltip = "$($r.Agent): $($r.NotResponding) unanswered alerts across $($r.Conversations) conversations; $($r.Handled) handled; avg alert $($r.AvgAlertSec)s"
+            }) | Out-Null
+    }
+    $svg = New-ReportBarsSvg -Items $items.ToArray() -Threshold $t.NotResponding
+    $note = if ($items.Count -gt 0) { "Unanswered alerts per agent (top 10); $([string][char]0x25B2) at or over the $($t.NotResponding) reference. Presence is not pulled; this is the conversation-side signal." } else { 'No unanswered agent alerts in this window.' }
+    & $add 'Agents not responding' 'Agents' $note $svg
+
+    return $charts.ToArray()
+}
+
+
+function ConvertTo-ReportAnchor {
+    param([string]$Title)
+    return 't-' + ([regex]::Replace($Title.ToLowerInvariant(), '[^a-z0-9]+', '-').Trim('-'))
+}
+
+function Get-ReportThresholdText {
+    param([object]$Thresholds)
+    $t = if ($null -ne $Thresholds) { $Thresholds } else { Get-DefaultReportThresholds }
+    return "Reference thresholds: abandon $($t.AbandonPct)%, within service level $($t.WithinSlaPct)%, transfers $($t.TransferPct)%, poor MOS $($t.PoorMosPct)%, unanswered alerts per agent $($t.NotResponding), platform disconnects $($t.SystemDisconnectPct)%. Generic starting points; set reportThresholds in the config file to match your service targets."
+}
+
+function Get-ReportTableSummary {
+    # One line for a collapsed table so a closed section still informs: row count plus the leading row.
+    param([string]$Title, [object[]]$Rows)
+    if ($Rows.Count -eq 0) { return 'no rows' }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $parts.Add(('{0:N0} rows' -f $Rows.Count)) | Out-Null
+    if ($Title -notin @('Hourly', 'Daily', 'Voice Quality')) {
+        $first = $Rows[0]
+        $labelProp = @($first.PSObject.Properties | Where-Object { $_.Value -is [string] -and $_.Name -ne 'Volume' } | Select-Object -First 1)
+        if ($labelProp.Count -gt 0) {
+            $lead = "top: $($labelProp[0].Value)"
+            if ($null -ne $first.PSObject.Properties['Conversations']) { $lead += " ($($first.Conversations))" }
+            $parts.Add($lead) | Out-Null
+        }
+    }
+    return ($parts -join ' ' + [string][char]0x00B7 + ' ')
+}
+
 function ConvertTo-ConversationReportHtml {
+    # Layout: headline and observations, then the dashboard charts (instant awareness), then KPI tiles,
+    # then the breakdown tables collapsed as evidence. Print output is the executive brief: everything
+    # above the tables.
     param([Parameter(Mandatory = $true)][object]$Report)
 
     $enc = { param($v) [System.Net.WebUtility]::HtmlEncode([string]$v) }
+    $thresholds = if ($null -ne $Report.PSObject.Properties['Thresholds']) { $Report.Thresholds } else { $null }
     $sb = [System.Text.StringBuilder]::new()
     $null = $sb.AppendLine('<!DOCTYPE html>')
     $null = $sb.AppendLine('<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">')
     $null = $sb.AppendLine("<title>$(& $enc $Report.Title)</title>")
-    $null = $sb.AppendLine(@"
+    $null = $sb.AppendLine(@'
 <style>
-:root { --bg:#ffffff; --fg:#1f2328; --muted:#636c76; --line:#d0d7de; --tile:#f6f8fa; --accent:#0b5cad; --bar:#9cc3eb; --warn:#fff8e1; --warnline:#e0b000; }
-@media (prefers-color-scheme: dark) { :root { --bg:#0d1117; --fg:#e6edf3; --muted:#9198a1; --line:#30363d; --tile:#161b22; --accent:#4493f8; --bar:#1f4f86; --warn:#2a2410; --warnline:#9e7a00; } }
+:root { --bg:#ffffff; --fg:#1f2328; --muted:#636c76; --line:#d0d7de; --tile:#f6f8fa; --accent:#0b5cad; --bar:#9cc3eb; --warn:#fff8e1; --warnline:#e0b000; --serious:#b3261e; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0d1117; --fg:#e6edf3; --muted:#9198a1; --line:#30363d; --tile:#161b22; --accent:#4493f8; --bar:#1f4f86; --warn:#2a2410; --warnline:#9e7a00; --serious:#f28b82; } }
 * { box-sizing:border-box; }
+html { scroll-behavior:smooth; }
 body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 "Segoe UI", system-ui, sans-serif; }
-main { max-width:1200px; margin:0 auto; padding:24px 16px 48px; }
+main { max-width:1200px; margin:0 auto; padding:24px 16px 72px; }
 h1 { font-size:24px; margin:0 0 4px; }
-h2 { font-size:18px; margin:32px 0 4px; padding-top:8px; border-top:1px solid var(--line); }
+h2 { font-size:18px; margin:28px 0 4px; padding-top:8px; border-top:1px solid var(--line); }
 h3 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); margin:18px 0 6px; }
 .meta, .desc, .units { color:var(--muted); font-size:13px; }
 .headline { margin:16px 0; padding:12px 14px; border-left:4px solid var(--accent); background:var(--tile); font-size:15px; }
+nav { position:sticky; top:0; z-index:5; background:var(--bg); border-bottom:1px solid var(--line); padding:8px 0; margin:12px 0; display:flex; flex-wrap:wrap; gap:4px 12px; align-items:center; font-size:13px; }
+nav a { color:var(--accent); white-space:nowrap; text-decoration:none; }
+nav a:hover { text-decoration:underline; }
+nav .grp { color:var(--muted); margin-left:6px; }
+nav .toolbar { margin-left:auto; display:flex; gap:6px; }
+button.ctl { font:inherit; font-size:12px; color:var(--accent); background:var(--tile); border:1px solid var(--line); border-radius:4px; padding:3px 8px; cursor:pointer; }
+button.ctl:hover { border-color:var(--accent); }
 .tiles { display:grid; grid-template-columns:repeat(auto-fill, minmax(170px, 1fr)); gap:8px; }
 .tile { background:var(--tile); border:1px solid var(--line); border-radius:6px; padding:8px 10px; }
 .tile .k { color:var(--muted); font-size:12px; }
 .tile .v { font-size:18px; font-weight:600; }
 .tile .d { color:var(--muted); font-size:11px; }
-.obs { background:var(--warn); border:1px solid var(--warnline); border-radius:6px; padding:8px 12px 8px 28px; }
-nav a { color:var(--accent); margin-right:12px; white-space:nowrap; }
+.obs { background:var(--warn); border:1px solid var(--warnline); border-radius:6px; padding:8px 12px 8px 28px; margin:8px 0; }
+.charts { display:grid; grid-template-columns:repeat(auto-fit, minmax(440px, 1fr)); gap:14px; margin-top:10px; }
+@media (max-width: 520px) { .charts { grid-template-columns:1fr; } }
+figure.chart { margin:0; background:var(--tile); border:1px solid var(--line); border-radius:6px; padding:10px 12px; min-width:0; }
+figure.chart figcaption { font-weight:600; font-size:14px; margin-bottom:6px; display:flex; justify-content:space-between; gap:8px; align-items:baseline; }
+figure.chart figcaption a { font-weight:400; font-size:12px; color:var(--accent); white-space:nowrap; }
+figure.chart svg { width:100%; height:auto; display:block; font:11px "Segoe UI", system-ui, sans-serif; }
+figure.chart .note, figure.chart .empty { color:var(--muted); font-size:12px; margin:6px 0 0; }
+svg text { fill:var(--fg); }
+svg .grid { stroke:var(--line); stroke-width:1; }
+svg .bar { fill:var(--bar); }
+svg .bar.hot { fill:var(--serious); }
+svg .line { fill:none; stroke:var(--accent); stroke-width:2; stroke-linejoin:round; stroke-linecap:round; }
+svg .dot { fill:var(--accent); stroke:var(--tile); stroke-width:2; }
+svg .dot.hot { fill:var(--serious); }
+svg .ref { stroke:var(--warnline); stroke-width:1.5; stroke-dasharray:5 4; }
+svg .ptitle { fill:var(--muted); font-size:11px; font-weight:600; }
+svg .yl, svg .xl, svg .rl, svg .vl { fill:var(--muted); font-size:10px; }
+svg .yl { text-anchor:end; }
+svg .xl { text-anchor:middle; }
+svg .rl { text-anchor:end; }
+svg .bl { font-size:11px; text-anchor:end; }
+details.tbl { border:1px solid var(--line); border-radius:6px; margin:10px 0; }
+details.tbl > summary { cursor:pointer; padding:8px 12px; display:flex; flex-wrap:wrap; gap:4px 14px; align-items:baseline; }
+details.tbl > summary .t { font-weight:600; font-size:15px; }
+details.tbl > summary .c { color:var(--muted); font-size:12px; }
+details.tbl > summary .tier { font-size:11px; color:var(--muted); border:1px solid var(--line); border-radius:10px; padding:0 7px; margin-left:auto; }
+details.tbl > .body { padding:0 12px 10px; }
 .scroll { overflow-x:auto; }
 table { border-collapse:collapse; width:100%; font-size:13px; }
 th, td { border-bottom:1px solid var(--line); padding:4px 8px; text-align:left; white-space:nowrap; }
-th { position:sticky; top:0; background:var(--tile); }
+th { background:var(--tile); }
 td.n { text-align:right; font-variant-numeric:tabular-nums; }
 tbody tr:nth-child(even) { background:color-mix(in srgb, var(--tile) 60%, transparent); }
-@media print { h2 { break-before:auto; } .scroll { overflow:visible; } }
-</style></head><body><main>
-"@)
+tr.x { display:none; }
+.showall { margin-top:6px; }
+.totop { position:fixed; right:18px; bottom:18px; background:var(--accent); color:#fff; padding:8px 14px; border-radius:20px; text-decoration:none; font-size:13px; box-shadow:0 2px 6px rgba(0,0,0,.25); }
+.print-only { display:none; }
+@media print {
+  @page { margin:12mm; }
+  :root { --bg:#ffffff; --fg:#1f2328; --muted:#636c76; --line:#d0d7de; --tile:#f6f8fa; --accent:#0b5cad; --bar:#9cc3eb; --warn:#fff8e1; --warnline:#e0b000; --serious:#b3261e; }
+  body { font-size:12px; }
+  main { padding:0; max-width:none; }
+  nav, .totop, .toolbar, #tables, .showall { display:none !important; }
+  .print-only { display:block; }
+  .charts { grid-template-columns:1fr 1fr; gap:10px; }
+  figure.chart, .tiles, .headline, .obs { break-inside:avoid; }
+  .headline { border:1px solid var(--line); border-left-width:4px; }
+}
+</style></head><body><main id="top">
+'@)
     $null = $sb.AppendLine("<h1>$(& $enc $Report.Title)</h1>")
     $metaParts = [System.Collections.Generic.List[string]]::new()
     $metaParts.Add("Data window (conversation times): $(& $enc $Report.WindowStartLocal) to $(& $enc $Report.WindowEndLocal) ($(& $enc $Report.TimeZone))") | Out-Null
@@ -1781,11 +2219,29 @@ tbody tr:nth-child(even) { background:color-mix(in srgb, var(--tile) 60%, transp
     $null = $sb.AppendLine("<p class=""units"">$(& $enc $Report.Units)</p>")
     $null = $sb.AppendLine("<div class=""headline"">$(& $enc $Report.Headline)</div>")
 
-    $null = $sb.Append('<nav>')
-    foreach ($title in $Report.Tables.Keys) { $null = $sb.Append("<a href=""#t-$([Array]::IndexOf(@($Report.Tables.Keys), $title))"">$(& $enc $title)</a>") }
-    $null = $sb.AppendLine('</nav>')
+    $null = $sb.Append('<nav><a href="#observations">Observations</a><a href="#dashboard">Dashboard</a><a href="#kpis">Key metrics</a><span class="grp">Tables:</span>')
+    foreach ($title in $Report.Tables.Keys) { $null = $sb.Append("<a href=""#$(ConvertTo-ReportAnchor $title)"">$(& $enc $title)</a>") }
+    $null = $sb.AppendLine('<span class="toolbar"><button class="ctl" type="button" data-open="1">Expand all</button><button class="ctl" type="button" data-open="0">Collapse all</button></span></nav>')
 
-    $null = $sb.AppendLine('<h2>Key metrics</h2>')
+    $null = $sb.AppendLine('<section id="observations"><h2>Observations</h2>')
+    if (@($Report.Observations).Count -gt 0) {
+        $null = $sb.AppendLine('<ul class="obs">')
+        foreach ($line in $Report.Observations) { $null = $sb.AppendLine("<li>$(& $enc $line)</li>") }
+        $null = $sb.AppendLine('</ul>')
+    }
+    else { $null = $sb.AppendLine('<p class="desc">No reference thresholds were exceeded.</p>') }
+    $null = $sb.AppendLine("<p class=""desc"">$(& $enc (Get-ReportThresholdText $thresholds))</p></section>")
+
+    $null = $sb.AppendLine('<section id="dashboard"><h2>Dashboard</h2><p class="desc">Trends first, then the platform smoke detectors. Dashed lines are the reference thresholds; hover any mark for its numbers; each panel links to the table that holds its evidence.</p><div class="charts">')
+    foreach ($chart in @(Get-ReportChartSet -Report $Report)) {
+        $null = $sb.Append("<figure class=""chart""><figcaption>$(& $enc $chart.Title)<a href=""#$(ConvertTo-ReportAnchor $chart.Table)"">$(& $enc $chart.Table) table</a></figcaption>")
+        if ($chart.Svg) { $null = $sb.Append($chart.Svg); $null = $sb.Append("<p class=""note"">$(& $enc $chart.Note)</p>") }
+        else { $null = $sb.Append("<p class=""empty"">$(& $enc $chart.Note)</p>") }
+        $null = $sb.AppendLine('</figure>')
+    }
+    $null = $sb.AppendLine('</div></section>')
+
+    $null = $sb.AppendLine('<section id="kpis"><h2>Key metrics</h2>')
     foreach ($section in @($Report.Kpis | ForEach-Object Section | Select-Object -Unique)) {
         $null = $sb.AppendLine("<h3>$(& $enc $section)</h3><div class=""tiles"">")
         foreach ($kpi in @($Report.Kpis | Where-Object { $_.Section -eq $section })) {
@@ -1794,23 +2250,19 @@ tbody tr:nth-child(even) { background:color-mix(in srgb, var(--tile) 60%, transp
         }
         $null = $sb.AppendLine('</div>')
     }
+    $null = $sb.AppendLine('</section>')
+    $null = $sb.AppendLine('<p class="print-only desc">Executive brief. The breakdown tables, drill-down lists and conversation IDs are in the HTML version of this report.</p>')
 
-    $null = $sb.AppendLine('<h2>Observations</h2>')
-    if (@($Report.Observations).Count -gt 0) {
-        $null = $sb.AppendLine('<ul class="obs">')
-        foreach ($line in $Report.Observations) { $null = $sb.AppendLine("<li>$(& $enc $line)</li>") }
-        $null = $sb.AppendLine('</ul>')
-    }
-    else { $null = $sb.AppendLine('<p class="desc">No reference thresholds were exceeded.</p>') }
-    $null = $sb.AppendLine('<p class="desc">Reference thresholds are generic starting points; compare against your own service targets.</p>')
-
-    $tableIndex = 0
+    $null = $sb.AppendLine('<section id="tables"><h2>Breakdowns</h2><p class="desc">Evidence and drill-down. Aggregate tables open when short; drill-down lists stay collapsed until you need them. Long tables show 25 rows until expanded.</p>')
     foreach ($title in $Report.Tables.Keys) {
         $table = $Report.Tables[$title]
         $rows = @($table.Rows)
-        $null = $sb.AppendLine("<h2 id=""t-$tableIndex"">$(& $enc $title)</h2><p class=""desc"">$(& $enc $table.Description)</p>")
-        $tableIndex++
-        if ($rows.Count -eq 0) { $null = $sb.AppendLine('<p class="desc">No data.</p>'); continue }
+        $isDrill = $title -in $script:caDrillDownTables
+        $open = if (-not $isDrill -and $rows.Count -gt 0 -and $rows.Count -le $script:caReportOpenRowLimit) { ' open' } else { '' }
+        $tier = if ($isDrill) { 'drill-down' } else { 'aggregate' }
+        $null = $sb.AppendLine("<details class=""tbl"" id=""$(ConvertTo-ReportAnchor $title)""$open><summary><span class=""t"">$(& $enc $title)</span><span class=""c"">$(& $enc (Get-ReportTableSummary -Title $title -Rows $rows))</span><span class=""tier"">$tier</span></summary><div class=""body"">")
+        $null = $sb.AppendLine("<p class=""desc"">$(& $enc $table.Description)</p>")
+        if ($rows.Count -eq 0) { $null = $sb.AppendLine('<p class="desc">No data.</p></div></details>'); continue }
         $columns = @($rows[0].PSObject.Properties.Name | Where-Object { $_ -ne 'Volume' })
         # Share bars are scaled to the table's largest share so the peak row fills the cell.
         $maxShare = 0.0
@@ -1818,8 +2270,10 @@ tbody tr:nth-child(even) { background:color-mix(in srgb, var(--tile) 60%, transp
         $null = $sb.Append('<div class="scroll"><table><thead><tr>')
         foreach ($column in $columns) { $null = $sb.Append("<th>$(& $enc (ConvertTo-ReportHeaderText $column))</th>") }
         $null = $sb.AppendLine('</tr></thead><tbody>')
+        $rowIndex = 0
         foreach ($row in $rows) {
-            $null = $sb.Append('<tr>')
+            $rowIndex++
+            $null = $sb.Append($(if ($rowIndex -gt $script:caReportVisibleRowLimit) { '<tr class="x">' } else { '<tr>' }))
             foreach ($column in $columns) {
                 $value = $row.$column
                 if ($null -eq $value -or [string]$value -eq '') { $null = $sb.Append('<td></td>'); continue }
@@ -1834,8 +2288,30 @@ tbody tr:nth-child(even) { background:color-mix(in srgb, var(--tile) 60%, transp
             $null = $sb.AppendLine('</tr>')
         }
         $null = $sb.AppendLine('</tbody></table></div>')
+        if ($rows.Count -gt $script:caReportVisibleRowLimit) { $null = $sb.AppendLine(('<button class="ctl showall" type="button">Show all {0:N0} rows</button>' -f $rows.Count)) }
+        $null = $sb.AppendLine('</div></details>')
     }
+    $null = $sb.AppendLine('</section>')
 
+    $null = $sb.AppendLine('<a class="totop" href="#top" title="Back to top">&#8593; Top</a>')
+    $null = $sb.AppendLine(@'
+<script>
+(function () {
+  var setAll = function (open) { document.querySelectorAll('details.tbl').forEach(function (d) { d.open = open; }); };
+  document.querySelectorAll('[data-open]').forEach(function (b) { b.addEventListener('click', function () { setAll(b.getAttribute('data-open') === '1'); }); });
+  document.querySelectorAll('.showall').forEach(function (b) {
+    b.addEventListener('click', function () { b.closest('details').querySelectorAll('tr.x').forEach(function (r) { r.classList.remove('x'); }); b.remove(); });
+  });
+  var reveal = function () {
+    if (!location.hash) { return; }
+    var el = document.getElementById(location.hash.slice(1));
+    if (el && el.tagName === 'DETAILS') { el.open = true; }
+  };
+  window.addEventListener('hashchange', reveal);
+  reveal();
+})();
+</script>
+'@)
     $null = $sb.AppendLine('</main></body></html>')
     return $sb.ToString()
 }
@@ -1864,6 +2340,7 @@ function ConvertTo-ConversationReportJson {
         headline          = $Report.Headline
         kpis              = @($Report.Kpis | Select-Object Section, Metric, Value, Unit, Detail)
         observations      = @($Report.Observations)
+        thresholds        = $Report.Thresholds
         tables            = $tables
     }
     return ($payload | ConvertTo-Json -Depth 8)

@@ -206,3 +206,187 @@ Describe 'Segment error codes' {
         @($report.Observations | Where-Object { $_ -match 'error code|WebRTC' }).Count | Should -Be 0
     }
 }
+
+Describe 'Business time zone (US Eastern) interval handling' {
+    It 'resolves the Eastern time zone' {
+        (Get-BusinessTimeZone).BaseUtcOffset | Should -Be ([TimeSpan]::FromHours(-5))
+    }
+
+    It 'converts Eastern wall-clock to UTC honouring daylight saving' {
+        # EDT (UTC-4): 2026-07-01 00:00 Eastern = 04:00Z
+        $summer = ConvertFrom-BusinessTime ([DateTime]::new(2026, 7, 1, 0, 0, 0))
+        $summer.Kind | Should -Be ([DateTimeKind]::Utc)
+        $summer | Should -Be ([DateTime]::new(2026, 7, 1, 4, 0, 0, [DateTimeKind]::Utc))
+        # EST (UTC-5): 2026-01-15 23:59:59 Eastern = 2026-01-16 04:59:59Z
+        $winter = ConvertFrom-BusinessTime ([DateTime]::new(2026, 1, 15, 23, 59, 59))
+        $winter | Should -Be ([DateTime]::new(2026, 1, 16, 4, 59, 59, [DateTimeKind]::Utc))
+    }
+
+    It 'ignores the Kind of the input and always reads it as Eastern' {
+        $asLocal = [DateTime]::SpecifyKind([DateTime]::new(2026, 7, 1, 0, 0, 0), [DateTimeKind]::Local)
+        $asUtc = [DateTime]::SpecifyKind([DateTime]::new(2026, 7, 1, 0, 0, 0), [DateTimeKind]::Utc)
+        (ConvertFrom-BusinessTime $asLocal) | Should -Be ([DateTime]::new(2026, 7, 1, 4, 0, 0, [DateTimeKind]::Utc))
+        (ConvertFrom-BusinessTime $asUtc) | Should -Be ([DateTime]::new(2026, 7, 1, 4, 0, 0, [DateTimeKind]::Utc))
+    }
+
+    It 'moves a spring-forward gap time forward one hour instead of throwing' {
+        # 2026-03-08 02:30 does not exist in Eastern; it becomes 03:30 EDT = 07:30Z
+        $gap = ConvertFrom-BusinessTime ([DateTime]::new(2026, 3, 8, 2, 30, 0))
+        $gap | Should -Be ([DateTime]::new(2026, 3, 8, 7, 30, 0, [DateTimeKind]::Utc))
+    }
+
+    It 'round-trips UTC back to Eastern' {
+        $utc = [DateTime]::new(2026, 9, 1, 4, 0, 0, [DateTimeKind]::Utc)
+        (ConvertTo-BusinessTime $utc) | Should -Be ([DateTime]::new(2026, 9, 1, 0, 0, 0))
+        (ConvertTo-BusinessTime ([DateTime]::new(2026, 9, 1, 4, 0, 0, [DateTimeKind]::Unspecified))) | Should -Be ([DateTime]::new(2026, 9, 1, 0, 0, 0))
+    }
+
+    It 'labels the zone with the abbreviation and offset in force' {
+        Get-BusinessTimeZoneLabel -UtcValue ([DateTime]::new(2026, 7, 1, 12, 0, 0, [DateTimeKind]::Utc)) | Should -Be 'US Eastern (EDT, UTC-04:00)'
+        Get-BusinessTimeZoneLabel -UtcValue ([DateTime]::new(2026, 1, 1, 12, 0, 0, [DateTimeKind]::Utc)) | Should -Be 'US Eastern (EST, UTC-05:00)'
+    }
+
+    It 'parses a start/end interval string into UTC' {
+        $w = ConvertFrom-IntervalString '2026-09-01T04:00:00.000Z/2026-09-02T03:59:59.000Z'
+        $w.StartUtc | Should -Be ([DateTime]::new(2026, 9, 1, 4, 0, 0, [DateTimeKind]::Utc))
+        $w.EndUtc | Should -Be ([DateTime]::new(2026, 9, 2, 3, 59, 59, [DateTimeKind]::Utc))
+        ConvertFrom-IntervalString '' | Should -BeNullOrEmpty
+        ConvertFrom-IntervalString 'not-an-interval' | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-ConversationIntervalCoverage' {
+    BeforeAll {
+        $script:interval = '2026-09-01T04:00:00.000Z/2026-09-02T03:59:59.000Z'
+        function New-StartOnly { param([string]$Id, [object]$Start) [pscustomobject]@{ conversationId = $Id; conversationStart = $Start } }
+    }
+
+    It 'classifies conversationStart against the requested interval' {
+        $convs = @(
+            (New-StartOnly 'inside-1' '2026-09-01T04:00:00.000Z'),
+            (New-StartOnly 'inside-2' '2026-09-02T03:59:59.000Z'),
+            (New-StartOnly 'before-month' '2026-08-02T10:00:00.000Z'),
+            (New-StartOnly 'before-second' '2026-09-01T03:59:59.999Z'),
+            (New-StartOnly 'after' '2026-09-02T04:00:00.000Z'),
+            (New-StartOnly 'missing' $null)
+        )
+        $cov = Get-ConversationIntervalCoverage -Conversations $convs -Interval $script:interval
+        $cov.Total | Should -Be 6
+        $cov.Inside | Should -Be 2
+        $cov.StartedBefore | Should -Be 2
+        $cov.StartedAfter | Should -Be 1
+        $cov.MissingStart | Should -Be 1
+        $cov.EarliestStartUtc | Should -Be ([DateTime]::new(2026, 8, 2, 10, 0, 0, [DateTimeKind]::Utc))
+        $cov.LatestStartUtc | Should -Be ([DateTime]::new(2026, 9, 2, 4, 0, 0, [DateTimeKind]::Utc))
+    }
+
+    It 'accepts DateTime values as produced by ConvertFrom-Json' {
+        $json = '[{"conversationId":"a","conversationStart":"2026-09-01T12:00:00.000Z"},{"conversationId":"b","conversationStart":"2026-07-01T12:00:00.000Z"}]'
+        $cov = Get-ConversationIntervalCoverage -Conversations @($json | ConvertFrom-Json) -Interval $script:interval
+        $cov.Inside | Should -Be 1
+        $cov.StartedBefore | Should -Be 1
+    }
+
+    It 'handles an empty collection and rejects a malformed interval' {
+        $cov = Get-ConversationIntervalCoverage -Conversations @() -Interval $script:interval
+        $cov.Total | Should -Be 0
+        $cov.EarliestStartUtc | Should -BeNullOrEmpty
+        { Get-ConversationIntervalCoverage -Conversations @() -Interval 'bad' } | Should -Throw
+    }
+}
+
+Describe 'Report thresholds and HTML layout' {
+    BeforeAll {
+        $script:abandonedConv = New-TestConversation -Id 'ab-1'
+        # Drop both agents so the ACD leg is an abandon: nOffered + tAbandon, nobody answers.
+        $script:abandonedConv.participants = @($script:abandonedConv.participants[0], $script:abandonedConv.participants[1])
+        $script:abandonedConv.participants[1].sessions[0].metrics = @(
+            [pscustomobject]@{ name = 'nOffered'; value = 1; emitDate = '2026-09-01T10:00:01.000Z' },
+            [pscustomobject]@{ name = 'tAbandon'; value = 20000; emitDate = '2026-09-01T10:00:01.000Z' })
+        $script:okConv = New-TestConversation -Id 'ok-2'
+        $script:okConv.participants[1].sessions[0].metrics = @(
+            [pscustomobject]@{ name = 'nOffered'; value = 1; emitDate = '2026-09-01T10:00:01.000Z' },
+            [pscustomobject]@{ name = 'tAnswered'; value = 5000; emitDate = '2026-09-01T10:00:01.000Z' })
+        $script:okConv.participants[2].sessions[0].metrics += [pscustomobject]@{ name = 'tNotResponding'; value = 30000; emitDate = '2026-09-01T10:00:02.000Z' }
+        $script:layoutProfiles = @(
+            (Get-ConversationProfile -Conversation $script:abandonedConv),
+            (Get-ConversationProfile -Conversation $script:okConv))
+        $script:layoutLookups = New-ConversationLookupTable
+    }
+
+    It 'ships defaults and merges overrides from a hashtable or a JSON object, ignoring unknown keys' {
+        $defaults = Get-DefaultReportThresholds
+        $defaults.AbandonPct | Should -Be 5
+        $defaults.NotResponding | Should -Be 5
+        $merged = Resolve-ReportThresholds -Overrides @{ abandonpct = 12.5; NotResponding = '3'; Bogus = 99 }
+        $merged.AbandonPct | Should -Be 12.5
+        $merged.NotResponding | Should -Be 3
+        $merged.WithinSlaPct | Should -Be 80
+        $merged.Contains('Bogus') | Should -BeFalse
+        $fromJson = Resolve-ReportThresholds -Overrides ('{"SystemDisconnectPct": 2, "TransferPct": "not a number"}' | ConvertFrom-Json)
+        $fromJson.SystemDisconnectPct | Should -Be 2
+        $fromJson.TransferPct | Should -Be 15
+    }
+
+    It 'applies the thresholds to the observations and exposes them on the report and in the JSON' {
+        $loose = Get-ConversationReport -Profiles $script:layoutProfiles -Lookups $script:layoutLookups -Source 'test' -QueryInterval '' -Thresholds @{ AbandonPct = 60; NotResponding = 2 }
+        $loose.Thresholds.AbandonPct | Should -Be 60
+        @($loose.Observations | Where-Object { $_ -match 'Abandon rate is' }).Count | Should -Be 0
+        @($loose.Observations | Where-Object { $_ -match 'unanswered alerts' }).Count | Should -Be 0
+        $strict = Get-ConversationReport -Profiles $script:layoutProfiles -Lookups $script:layoutLookups -Source 'test' -QueryInterval '' -Thresholds @{ AbandonPct = 40; NotResponding = 1 }
+        @($strict.Observations | Where-Object { $_ -match 'above the 40% reference threshold' }).Count | Should -Be 1
+        @($strict.Observations | Where-Object { $_ -match 'tNotResponding; 1 reference' }).Count | Should -Be 1
+        $json = ConvertTo-ConversationReportJson -Report $strict | ConvertFrom-Json
+        $json.thresholds.AbandonPct | Should -Be 40
+        $json.thresholds.NotResponding | Should -Be 1
+    }
+
+    It 'renders the dashboard charts above the KPI tiles with threshold lines and evidence links' {
+        $report = Get-ConversationReport -Profiles $script:layoutProfiles -Lookups $script:layoutLookups -Source 'test' -QueryInterval '' -Thresholds @{ AbandonPct = 7.5 }
+        $charts = @(Get-ReportChartSet -Report $report)
+        $charts.Title | Should -Contain 'Disconnect reasons'
+        $charts.Title | Should -Contain 'Queue abandon rate'
+        $charts.Title | Should -Contain 'Agents not responding'
+        $charts.Title | Should -Not -Contain 'Daily trend'   # a single day is not a trend
+        $html = ConvertTo-ConversationReportHtml -Report $report
+        $html.IndexOf('id="observations"') | Should -BeLessThan $html.IndexOf('id="dashboard"')
+        $html.IndexOf('id="dashboard"') | Should -BeLessThan $html.IndexOf('id="kpis"')
+        $html.IndexOf('id="kpis"') | Should -BeLessThan $html.IndexOf('id="tables"')
+        $html | Should -Match '<svg viewBox='
+        $html | Should -Match 'class="ref"'
+        $html | Should -Match 'ref 7\.5%'
+        $html | Should -Match 'href="#t-queues">Queues table</a>'
+        $html | Should -Match 'class="totop"'
+        $html | Should -Match 'data-open="1"'
+        $html | Should -Match 'Reference thresholds: abandon 7\.5%'
+    }
+
+    It 'collapses drill-down tables, opens short aggregates, and caps long tables at 25 visible rows' {
+        $report = Get-ConversationReport -Profiles $script:layoutProfiles -Lookups $script:layoutLookups -Source 'test' -QueryInterval ''
+        $html = ConvertTo-ConversationReportHtml -Report $report
+        $html | Should -Match '<details class="tbl" id="t-queues" open>'
+        $html | Should -Match '<details class="tbl" id="t-agents"><summary>'
+        $html | Should -Match '<details class="tbl" id="t-longest"><summary>'
+        $html | Should -Match '<span class="tier">drill-down</span>'
+        # 30 distinct wrap-up codes: the table starts collapsed, shows 25 rows and offers the rest.
+        $many = 1..30 | ForEach-Object {
+            $c = New-TestConversation -Id "wrap-$_"
+            $c.participants[3].sessions[0].segments[0] | Add-Member -NotePropertyName wrapUpCode -NotePropertyValue "code-$_"
+            Get-ConversationProfile -Conversation $c
+        }
+        $big = ConvertTo-ConversationReportHtml -Report (Get-ConversationReport -Profiles @($many) -Lookups $script:layoutLookups -Source 'test' -QueryInterval '')
+        $big | Should -Match '<details class="tbl" id="t-wrap-up-codes"><summary>'
+        ([regex]::Matches($big, '<tr class="x">')).Count | Should -Be 5
+        $big | Should -Match 'Show all 30 rows'
+    }
+
+    It 'hides the breakdown tables in print so the PDF is the executive brief' {
+        $report = Get-ConversationReport -Profiles $script:layoutProfiles -Lookups $script:layoutLookups -Source 'test' -QueryInterval ''
+        $html = ConvertTo-ConversationReportHtml -Report $report
+        $print = [regex]::Match($html, '@media print \{(?<body>.*?)\n\}', 'Singleline').Groups['body'].Value
+        $print | Should -Match '#tables'
+        $print | Should -Match 'display:none'
+        $print | Should -Match '\.print-only \{ display:block; \}'
+        $html | Should -Match 'Executive brief'
+    }
+}

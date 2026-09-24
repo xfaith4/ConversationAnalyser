@@ -4,17 +4,27 @@
     GenesysConvAnalyzer.ps1 - Conversation Detail Analysis Tool for Genesys Cloud
 
 .DESCRIPTION
-    Purpose-built WPF application for deep conversation analytics using the async
-    job pattern (/api/v2/analytics/conversations/details/jobs). Designed for orgs
-    with high conversation volume where engineers need to:
+    Purpose-built WPF application for deep conversation analytics using the paged
+    synchronous query (POST /api/v2/analytics/conversations/details/query). Designed
+    for orgs with high conversation volume where engineers need to:
 
-    - Set up targeted async queries across any filter dimension
-    - Collect and page through large result sets with live progress
+    - Set up targeted queries across any filter dimension
+    - Page through large result sets with live progress; intervals longer than the
+      API's 7-day cap are split into consecutive windows and merged (deduplicated)
     - Inspect conversations with full participant/segment/attribute detail
     - Export flattened rows (CSV) or full conversation objects (JSONL) for downstream tools
 
     The workflow is:
-        Query Builder > Submit Job > Poll Status > Collect Results > Analyze / Export
+        Query Builder > Run Query (paged, live progress in Query Monitor) > Results > Analyze / Export
+
+    Paged query
+    -----------
+    src/query/ConversationDetailQuery.ps1 owns the paging: pageSize 100 (API maximum),
+    pageNumber incremented until a short page or totalHits is reached, one 7-day window
+    at a time, with a per-run page cap and a Stop button checked before every request.
+    The sync endpoint has no startOfDayIntervalMatching option, so that checkbox is
+    applied client-side with the same rule (conversationStart on/after 00:00 UTC of the
+    interval start date).
 
     Region validation
     -----------------
@@ -38,20 +48,19 @@
 
     Request preview and submit
     --------------------------
-    The Preview button and the Submit button both call Build-QueryRequestPreview, which
+    The Preview button and the Run Query button both call Build-QueryRequestPreview, which
     in turn calls Build-QueryBody.  Both operations therefore use the identical endpoint
-    URI and request body.  The preview panel is updated by Submit before the API call
-    so the logged body exactly matches what is sent.
+    URI and request body.  The preview panel is updated by Run Query before the API call
+    so the logged body exactly matches the first page request that is sent.
 
     API retry policy
     ----------------
     Direct REST calls made through Invoke-GcApiRequest retry transient 429 and 5xx
     failures for GET/HEAD/OPTIONS/DELETE using exponential backoff. Retry-After is
-    honored when present and each retry attempt is written to the job log. POST job
-    submission is not retried automatically to avoid accidental duplicate async jobs.
-    When retries are exhausted, the UI reports that separately from an immediate fatal
-    request failure. Cancel/delete failures are logged as warnings instead of being
-    ignored.
+    honored when present and each retry attempt is written to the activity log. The
+    details query POST is a read-only request, so it is retried under the same policy
+    (a retry profile with allowRetryOnPost). When retries are exhausted, the UI reports
+    that separately from an immediate fatal request failure.
 
     Analysis and reporting
     ----------------------
@@ -66,7 +75,7 @@
         hour, date, media/direction, wrap-up, disconnect, IVR flow, voice quality,
         division, plus longest / lowest-MOS outliers. Export Report writes a
         self-contained HTML file and a JSON copy of the same numbers.
-    After collection (when authenticated) queue, wrap-up code, division, skill, and
+    After a query (when authenticated) queue, wrap-up code, division, skill, and
     language IDs are resolved to names, and the agents present in the data are
     resolved in batches via GET /api/v2/users?id=...; failures fall back to IDs and
     are logged.
@@ -80,7 +89,7 @@
     rules that watch or act on it (all rules are read once and matched by campaign ID),
     and the newest outbound events that mention it (org-wide event log, filtered by ID).
     "Analyze Conversations" pre-fills the Query Builder with an outboundCampaignId segment
-    filter and a date window so the normal job / results / report flow applies.
+    filter and a date window so the normal query / results / report flow applies.
 
 .NOTES
     Requirements : Windows, PowerShell 5.1+, a Genesys Cloud "Code Authorization" OAuth
@@ -118,6 +127,7 @@ Add-Type -AssemblyName System.Windows.Forms
 . (Join-Path $PSScriptRoot 'src/auth/PkceAuth.ps1')
 . (Join-Path $PSScriptRoot 'src/analysis/ConversationAnalysis.ps1')
 . (Join-Path $PSScriptRoot 'src/campaign/CampaignAnalysis.ps1')
+. (Join-Path $PSScriptRoot 'src/query/ConversationDetailQuery.ps1')
 
 # -----------------------------------------------------------------------------
 # Config / Auth  (shared pattern with GenesysCore-GUI.ps1)
@@ -155,6 +165,14 @@ $script:configPath = Resolve-UIConfigPath -ExplicitPath $ConfigPath
 function Read-GenesysEnvConfig {
     if (-not (Test-Path $script:configPath)) { return $null }
     try { return Get-Content $script:configPath -Raw -Encoding utf8 | ConvertFrom-Json } catch { return $null }
+}
+
+function Get-ConfiguredReportThresholds {
+    # Optional reportThresholds object from the config file (see GenesysConvAnalyzer.config.example.json).
+    # Keys match Get-DefaultReportThresholds; missing keys keep their defaults.
+    $cfg = Read-GenesysEnvConfig
+    if ($null -eq $cfg -or $null -eq $cfg.PSObject.Properties['reportThresholds']) { return $null }
+    return $cfg.reportThresholds
 }
 
 function Save-GenesysEnvConfig {
@@ -223,15 +241,16 @@ $script:gcApiRequestInvoker = {
     Invoke-RestMethod @InvokeParams
 }
 $script:gcApiRetryLogAction = $null
-$script:currentJobId = $null
-$script:pollTimer = $null
-$script:pollCount = 0
-$script:jobSubmitTime = $null
+$script:queryRunning = $false           # a paged query is in progress (runs on the UI thread, pumped with DoEvents)
+$script:queryStopRequested = $false     # set by Stop Query; checked before every page request
+$script:queryStartTime = $null
+$script:queryDroppedByStartOfDay = 0    # conversations removed by the client-side start-of-day filter in the current run
+$script:queryLastPagesRead = 0          # pages received in the current run (for error messages)
 $script:allConversations = [System.Collections.Generic.List[object]]::new()
 $script:conversationIndex = @{}
 $script:selectedAttrCols = [System.Collections.Generic.List[string]]::new()
 $script:visibleStdCols = [System.Collections.Generic.List[string]]::new([string[]]@(Get-DefaultGridColumnNames))
-$script:maxGridRows = 20000  # Display cap to keep the WPF grid responsive on large jobs
+$script:maxGridRows = 20000  # Display cap to keep the WPF grid responsive on large result sets
 $script:exportRedactionMode = $true  # Safe-by-default export behavior
 
 # -- Analysis caches (see src/analysis/ConversationAnalysis.ps1) ---------------
@@ -244,18 +263,15 @@ $script:lookupsLoaded = $false       # org-wide reference types loaded (users ar
 $script:lookupVersion = 0            # bumped on every lookup refresh to invalidate cached rows
 $script:maxLookupPages = 100         # 100 pages x 100 entities per reference type
 $script:userLookupBatchSize = 50     # user IDs per GET /api/v2/users?id=... call (API caps the list at pageSize, max 100)
-$script:dataSource = ''              # shown in the report header ("Analytics job <id>" or "File <name>")
+$script:dataSource = ''              # shown in the report header ("Analytics query <interval>" or "File <name>")
 $script:dataQueryInterval = ''
-$script:currentJobInterval = ''
+$script:currentQueryInterval = ''
+$script:currentQueryStartOfDayMatching = $false
 
-# -- Polling and paging guardrails ---------------------------------------------
-$script:maxPollCount = 600    # Stop polling after this many attempts (~30 min at 3s interval)
-$script:maxPollTimeoutMinutes = 30     # Hard timeout regardless of poll count
-$script:maxConsecutivePollErrors = 5      # Stop after this many consecutive poll failures
-$script:consecutivePollErrors = 0      # Running count, reset on each successful poll
-
-$script:maxPageCount = 500    # Stop paging after this many pages (500k conversations at 1000/page)
-$script:seenCursors = $null  # HashSet populated during collection to detect cursor loops
+# -- Paged query guardrails (see src/query/ConversationDetailQuery.ps1) --------
+$script:queryPageSize = 100        # API maximum for POST /analytics/conversations/details/query
+$script:queryMaxWindowDays = 7     # API caps one query interval at 7 days; longer intervals are split into windows
+$script:queryMaxPages = 1000       # Stop after this many page requests in one run (100k conversations at 100/page)
 $script:convFilterRows = [System.Collections.Generic.List[pscustomobject]]::new()
 $script:segFilterRows = [System.Collections.Generic.List[pscustomobject]]::new()
 
@@ -276,7 +292,8 @@ function Invoke-GcApiRequest {
         [string]$Path,
         [string]$Body,
         [hashtable]$QueryParams,
-        [scriptblock]$RequestInvoker
+        [scriptblock]$RequestInvoker,
+        [psobject]$RetrySettings
     )
 
     $effectiveInvoker = if ($PSBoundParameters.ContainsKey('RequestInvoker') -and $null -ne $RequestInvoker) {
@@ -286,30 +303,23 @@ function Invoke-GcApiRequest {
         $script:gcApiRequestInvoker
     }
 
-    return Invoke-UiApiRequest -BaseUri $script:baseUri -Method $Method -Path $Path -Headers $script:headers -Body $Body -QueryParams $QueryParams -RetrySettings $script:gcApiRetrySettings -RequestInvoker $effectiveInvoker -LogAction $script:gcApiRetryLogAction
+    $effectiveRetry = if ($PSBoundParameters.ContainsKey('RetrySettings') -and $null -ne $RetrySettings) {
+        $RetrySettings
+    }
+    else {
+        $script:gcApiRetrySettings
+    }
+
+    return Invoke-UiApiRequest -BaseUri $script:baseUri -Method $Method -Path $Path -Headers $script:headers -Body $Body -QueryParams $QueryParams -RetrySettings $effectiveRetry -RequestInvoker $effectiveInvoker -LogAction $script:gcApiRetryLogAction
 }
 
-function Submit-AnalyticsJob { param([string]$JsonBody) Invoke-GcApiRequest -Method 'POST' -Path '/api/v2/analytics/conversations/details/jobs' -Body $JsonBody }
-function Get-AnalyticsJobStatus { param([string]$JobId)    Invoke-GcApiRequest -Method 'GET' -Path "/api/v2/analytics/conversations/details/jobs/$JobId" }
-function Remove-AnalyticsJob {
-    param([string]$JobId)
+# The details query POST is read-only, so transient 429/5xx failures are retried like GETs.
+$script:gcApiQueryRetrySettings = Resolve-UiApiRetrySettings -RetryProfile ([pscustomobject]@{ allowRetryOnPost = $true })
 
-    try {
-        Invoke-GcApiRequest -Method 'DELETE' -Path "/api/v2/analytics/conversations/details/jobs/$JobId" | Out-Null
-        return $true
-    }
-    catch {
-        $failureText = Format-UiApiFailure -Exception $_.Exception
-        Append-JobLog "Warning: cancel/delete request failed for job $JobId. $failureText"
-        return $false
-    }
-}
-
-function Get-AnalyticsJobResults {
-    param([string]$JobId, [int]$PageSize = 1000, [string]$Cursor)
-    $q = @{ pageSize = [string]$PageSize }
-    if (-not [string]::IsNullOrWhiteSpace($Cursor)) { $q['cursor'] = $Cursor }
-    Invoke-GcApiRequest -Method 'GET' -Path "/api/v2/analytics/conversations/details/jobs/$JobId/results" -QueryParams $q
+function Invoke-AnalyticsDetailQueryPage {
+    # Request callback for Invoke-ConversationDetailQuery (src/query/ConversationDetailQuery.ps1).
+    param([string]$Method, [string]$Path, [string]$JsonBody)
+    Invoke-GcApiRequest -Method $Method -Path $Path -Body $JsonBody -RetrySettings $script:gcApiQueryRetrySettings
 }
 
 # -----------------------------------------------------------------------------
@@ -580,6 +590,10 @@ function Read-ConversationsFromFile {
       <Setter Property="Margin" Value="2"/>
       <Setter Property="VerticalAlignment" Value="Center"/>
     </Style>
+    <Style TargetType="DatePicker">
+      <Setter Property="Margin" Value="2"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
   </Window.Resources>
 
   <Grid Margin="8">
@@ -645,6 +659,9 @@ function Read-ConversationsFromFile {
                 <Grid.RowDefinitions>
                   <RowDefinition Height="Auto"/>
                   <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
+                  <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
                 <!-- Quick presets row -->
                 <Label   Grid.Row="0" Grid.Column="0" Content="Preset:"/>
@@ -656,15 +673,24 @@ function Read-ConversationsFromFile {
                 <Button  Grid.Row="0" Grid.Column="6" Name="PresetLastMonth" Content="Last Month"/>
                 <!-- Date picker row -->
                 <Label       Grid.Row="1" Grid.Column="0" Content="From:"/>
-                <DatePicker  Grid.Row="1" Grid.Column="1" Name="StartDatePicker" Width="130" Margin="2"/>
+                <DatePicker  Grid.Row="1" Grid.Column="1" Name="StartDatePicker" Width="130"/>
                 <Label       Grid.Row="1" Grid.Column="2" Content="Time:"/>
-                <TextBox     Grid.Row="1" Grid.Column="3" Name="StartTimeTextBox" Width="90" Margin="2" ToolTip="Local time. Formats: HH:mm or HH:mm:ss"/>
+                <TextBox     Grid.Row="1" Grid.Column="3" Name="StartTimeTextBox" Width="90" ToolTip="US Eastern time (business HQ). Formats: HH:mm or HH:mm:ss"/>
                 <Label       Grid.Row="1" Grid.Column="4" Content="To:"/>
-                <DatePicker  Grid.Row="1" Grid.Column="5" Name="EndDatePicker"   Width="130" Margin="2"/>
+                <DatePicker  Grid.Row="1" Grid.Column="5" Name="EndDatePicker"   Width="130"/>
                 <Label       Grid.Row="1" Grid.Column="6" Content="Time:"/>
-                <TextBox     Grid.Row="1" Grid.Column="7" Name="EndTimeTextBox" Width="90" Margin="2" ToolTip="Local time. Formats: HH:mm or HH:mm:ss"/>
-                <TextBlock   Grid.Row="1" Grid.Column="8" Grid.ColumnSpan="4" Margin="8,0,0,0" VerticalAlignment="Center" Foreground="Gray"
-                             Text="Blank times default to 00:00:00 for start and 23:59:59 for end." TextWrapping="Wrap"/>
+                <TextBox     Grid.Row="1" Grid.Column="7" Name="EndTimeTextBox" Width="90" ToolTip="US Eastern time (business HQ). Formats: HH:mm or HH:mm:ss"/>
+                <!-- Hint and options rows span the full width so wrapping text can never squeeze a
+                     column and inflate the picker row (that is what stretched the DatePickers before). -->
+                <TextBlock   Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="13" Margin="4,2,2,2" Foreground="Gray" TextWrapping="Wrap"
+                             Name="IntervalHintText"
+                             Text="Enter dates and times in US Eastern (business HQ). The query is sent in UTC. Blank times default to 00:00:00 start / 23:59:59 end."/>
+                <CheckBox    Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="13" Margin="4,4,2,2" VerticalAlignment="Center"
+                             Name="StartOfDayMatchingCheckBox" IsChecked="True"
+                             Content="Only conversations that started on/after the interval start date (startOfDayIntervalMatching)"
+                             ToolTip="Applied client-side after the query (the details query endpoint has no startOfDayIntervalMatching option): conversations whose conversationStart is before 00:00 UTC of the interval start date are dropped. Without it every conversation with any segment inside the interval is kept, so long-lived email, message, or callback conversations that started days or weeks earlier are included."/>
+                <TextBlock   Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="13" Margin="4,2,2,2" Foreground="Gray" TextWrapping="Wrap"
+                             Name="IntervalUtcText" Text=""/>
               </Grid>
             </GroupBox>
 
@@ -741,6 +767,7 @@ function Read-ConversationsFromFile {
                 <TextBox Name="QueryPreviewBox" IsReadOnly="True" MaxHeight="180"
                          TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
                          FontFamily="Consolas" FontSize="11" Background="#F8F8F8"/>
+                <TextBlock Name="QueryPlanText" Margin="0,4,0,0" Foreground="Gray" TextWrapping="Wrap" Text=""/>
                 <WrapPanel Margin="0,4,0,0">
                   <Button Name="PreviewBtn"  Content="Preview Request"/>
                   <Button Name="ClearFiltersBtn" Content="Clear All Filters"/>
@@ -749,7 +776,8 @@ function Read-ConversationsFromFile {
             </GroupBox>
 
             <!-- Submit -->
-            <Button Name="SubmitJobBtn" Content="Submit Async Job"
+            <Button Name="RunQueryBtn" Content="Run Query"
+                    ToolTip="Runs the paged details query now. Progress is shown in the Query Monitor tab and the Results tab opens when it finishes."
                     FontSize="13" FontWeight="Bold" Height="38"
                     Background="#005A9C" Foreground="White"
                     HorizontalContentAlignment="Center"/>
@@ -758,8 +786,8 @@ function Read-ConversationsFromFile {
         </ScrollViewer>
       </TabItem>
 
-      <!-- == Tab 2: Job Monitor == -->
-      <TabItem Header=" Job Monitor " Name="JobMonitorTab">
+      <!-- == Tab 2: Query Monitor == -->
+      <TabItem Header=" Query Monitor " Name="QueryMonitorTab">
         <Grid Margin="6">
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -767,58 +795,71 @@ function Read-ConversationsFromFile {
             <RowDefinition Height="Auto"/>
           </Grid.RowDefinitions>
 
-          <!-- Job status panel -->
-          <GroupBox Grid.Row="0" Header="Current Job">
+          <!-- Query status panel -->
+          <GroupBox Grid.Row="0" Header="Current Query">
             <Grid>
               <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="70"/>
-                <ColumnDefinition Width="280"/>
-                <ColumnDefinition Width="70"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="360"/>
+                <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="100"/>
+                <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="60"/>
-                <ColumnDefinition Width="50"/>
-                <ColumnDefinition Width="70"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="60"/>
+                <ColumnDefinition Width="Auto"/>
                 <ColumnDefinition Width="80"/>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="60"/>
                 <ColumnDefinition Width="*"/>
               </Grid.ColumnDefinitions>
-              <Label   Grid.Column="0" Content="Job ID:"/>
-              <TextBox Grid.Column="1" Name="JobIdBox" IsReadOnly="True" Background="#F0F0F0" FontFamily="Consolas"/>
+              <Label   Grid.Column="0" Content="Interval:"/>
+              <TextBox Grid.Column="1" Name="QueryIntervalBox" IsReadOnly="True" Background="#F0F0F0" FontFamily="Consolas" ToolTip="Query interval as sent (UTC)"/>
               <Label   Grid.Column="2" Content="State:"/>
-              <TextBlock Grid.Column="3" Name="JobStateLabel" VerticalAlignment="Center" FontWeight="Bold" Margin="4,0,0,0"/>
-              <Label   Grid.Column="4" Content="Polls:"/>
-              <TextBlock Grid.Column="5" Name="JobPollLabel" VerticalAlignment="Center" Margin="4,0,0,0"/>
-              <Label   Grid.Column="6" Content="Elapsed:"/>
-              <TextBlock Grid.Column="7" Name="JobElapsedLabel" VerticalAlignment="Center" Margin="4,0,0,0"/>
-              <Button  Grid.Column="8" Name="CancelJobBtn" Content="Cancel / Delete Job"
-                       HorizontalAlignment="Left" Margin="10,2,2,2" Background="#C0392B" Foreground="White" IsEnabled="False"/>
+              <TextBlock Grid.Column="3" Name="QueryStateLabel" VerticalAlignment="Center" FontWeight="Bold" Margin="4,0,0,0" Text="IDLE"/>
+              <Label   Grid.Column="4" Content="Window:"/>
+              <TextBlock Grid.Column="5" Name="QueryWindowLabel" VerticalAlignment="Center" Margin="4,0,0,0" Text="-"
+                         ToolTip="Current 7-day query window / total windows for this interval"/>
+              <Label   Grid.Column="6" Content="Pages:"/>
+              <TextBlock Grid.Column="7" Name="QueryPagesLabel" VerticalAlignment="Center" Margin="4,0,0,0" Text="0"/>
+              <Label   Grid.Column="8" Content="Loaded:"/>
+              <TextBlock Grid.Column="9" Name="QueryRowsLabel" VerticalAlignment="Center" Margin="4,0,0,0" Text="0"
+                         ToolTip="Distinct conversations loaded so far"/>
+              <Label   Grid.Column="10" Content="Elapsed:"/>
+              <TextBlock Grid.Column="11" Name="QueryElapsedLabel" VerticalAlignment="Center" Margin="4,0,0,0" Text="00:00"/>
+              <Button  Grid.Column="12" Name="StopQueryBtn" Content="Stop Query"
+                       HorizontalAlignment="Left" Margin="10,2,2,2" Background="#C0392B" Foreground="White" IsEnabled="False"
+                       ToolTip="Ends the run after the page in flight. Conversations already received stay available in the Results tab."/>
             </Grid>
           </GroupBox>
 
           <!-- Activity log -->
           <GroupBox Grid.Row="1" Header="Activity Log">
-            <TextBox Name="JobLogBox" IsReadOnly="True" TextWrapping="NoWrap"
+            <TextBox Name="ActivityLogBox" IsReadOnly="True" TextWrapping="NoWrap"
                      VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
                      FontFamily="Consolas" FontSize="11" Background="#1E1E1E" Foreground="#D4D4D4"/>
           </GroupBox>
 
-          <!-- Collect bar -->
+          <!-- Status bar -->
           <Border Grid.Row="2" Background="#E8F4E8" BorderBrush="#4CAF50" BorderThickness="1" Padding="8,6" Margin="0,4,0,0">
             <Grid>
               <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="Auto"/>
               </Grid.ColumnDefinitions>
-              <TextBlock Grid.Column="0" Name="CollectStatusText"
-                         Text="Submit a job above. When it reaches FULFILLED, click Collect to page through results."
+              <TextBlock Grid.Column="0" Name="QueryStatusText"
+                         Text="Build a query in the Query Builder and click Run Query. Pages are collected here with live progress and the Results tab opens when the query finishes."
                          VerticalAlignment="Center" TextWrapping="Wrap"/>
-              <Button Grid.Column="1" Name="CollectResultsBtn"
-                      Content="Collect All Results" FontWeight="Bold"
+              <Button Grid.Column="1" Name="ShowResultsBtn"
+                      Content="Show Results" FontWeight="Bold"
                       Background="#27AE60" Foreground="White"
-                      IsEnabled="False" Width="180" Height="34"/>
+                      IsEnabled="False" Width="180" Height="34"
+                      ToolTip="Opens the Results tab for the conversations loaded so far."/>
             </Grid>
           </Border>
         </Grid>
       </TabItem>
+
 
       <!-- == Tab 3: Results == -->
       <TabItem Header=" Results " Name="ResultsTab">
@@ -834,7 +875,7 @@ function Read-ConversationsFromFile {
           <!-- Summary -->
           <Border Grid.Row="0" Background="#EBF5FB" BorderBrush="#2980B9" BorderThickness="1" Padding="6,4" Margin="0,0,0,6">
             <TextBlock Name="SummaryText" FontWeight="Bold" TextWrapping="Wrap"
-                       Text="No results loaded. Submit and collect a job first."/>
+                       Text="No results loaded. Run a query first."/>
           </Border>
 
           <!-- Toolbar -->
@@ -994,7 +1035,7 @@ function Read-ConversationsFromFile {
                       ToolTip="Newest outbound events that mention this campaign (org-wide event log, filtered by campaign ID)."/>
               <Button Name="AnalyzeCampaignBtn" Content="Analyze Conversations" FontWeight="Bold" IsEnabled="False"
                       Background="#005A9C" Foreground="White"
-                      ToolTip="Pre-fills the Query Builder with an outboundCampaignId segment filter and a date window. Review and submit the job there."/>
+                      ToolTip="Pre-fills the Query Builder with an outboundCampaignId segment filter and a date window. Review and run the query there."/>
               <Button Name="CopyCampaignIdBtn" Content="Copy ID" IsEnabled="False" ToolTip="Copy the campaign ID to the clipboard."/>
             </WrapPanel>
             <TabControl Grid.Row="2" Name="CampaignDetailTabs">
@@ -1074,6 +1115,8 @@ $startDatePicker = Get-Control 'StartDatePicker'
 $startTimeTextBox = Get-Control 'StartTimeTextBox'
 $endDatePicker = Get-Control 'EndDatePicker'
 $endTimeTextBox = Get-Control 'EndTimeTextBox'
+$startOfDayCheckBox = Get-Control 'StartOfDayMatchingCheckBox'
+$intervalUtcText = Get-Control 'IntervalUtcText'
 $directionCombo = Get-Control 'DirectionCombo'
 $mediaTypeCombo = Get-Control 'MediaTypeCombo'
 $orderByCombo = Get-Control 'OrderByCombo'
@@ -1085,19 +1128,22 @@ $requestEndpointBox = Get-Control 'RequestEndpointBox'
 $addConvFilterBtn = Get-Control 'AddConvFilterBtn'
 $addSegFilterBtn = Get-Control 'AddSegFilterBtn'
 $queryPreviewBox = Get-Control 'QueryPreviewBox'
+$queryPlanText = Get-Control 'QueryPlanText'
 $previewBtn = Get-Control 'PreviewBtn'
 $clearFiltersBtn = Get-Control 'ClearFiltersBtn'
-$submitJobBtn = Get-Control 'SubmitJobBtn'
+$runQueryBtn = Get-Control 'RunQueryBtn'
 
 $mainTabControl = Get-Control 'MainTabControl'
-$jobIdBox = Get-Control 'JobIdBox'
-$jobStateLabel = Get-Control 'JobStateLabel'
-$jobPollLabel = Get-Control 'JobPollLabel'
-$jobElapsedLabel = Get-Control 'JobElapsedLabel'
-$cancelJobBtn = Get-Control 'CancelJobBtn'
-$jobLogBox = Get-Control 'JobLogBox'
-$collectStatusText = Get-Control 'CollectStatusText'
-$collectResultsBtn = Get-Control 'CollectResultsBtn'
+$queryIntervalBox = Get-Control 'QueryIntervalBox'
+$queryStateLabel = Get-Control 'QueryStateLabel'
+$queryWindowLabel = Get-Control 'QueryWindowLabel'
+$queryPagesLabel = Get-Control 'QueryPagesLabel'
+$queryRowsLabel = Get-Control 'QueryRowsLabel'
+$queryElapsedLabel = Get-Control 'QueryElapsedLabel'
+$stopQueryBtn = Get-Control 'StopQueryBtn'
+$activityLogBox = Get-Control 'ActivityLogBox'
+$queryStatusText = Get-Control 'QueryStatusText'
+$showResultsBtn = Get-Control 'ShowResultsBtn'
 
 $summaryText = Get-Control 'SummaryText'
 $columnSelectorBtn = Get-Control 'ColumnSelectorBtn'
@@ -1156,11 +1202,11 @@ $redactExportsCheckBox.Add_Unchecked({ $script:exportRedactionMode = $false })
 
 function Set-Status { param([string]$Msg) $statusText.Text = $Msg }
 
-function Append-JobLog {
+function Append-ActivityLog {
     param([string]$Line)
     $ts = [DateTime]::Now.ToString('HH:mm:ss')
-    $jobLogBox.AppendText("[$ts] $Line`n")
-    $jobLogBox.ScrollToEnd()
+    $activityLogBox.AppendText("[$ts] $Line`n")
+    $activityLogBox.ScrollToEnd()
 }
 
 function Format-UiApiFailure {
@@ -1181,7 +1227,7 @@ function Write-UiApiRetryLogEntry {
         ''
     }
 
-    Append-JobLog "Transient $($Entry.Method) failure on attempt $($Entry.Attempt)/$($Entry.MaxAttempts) ($statusText). Retrying in $delayText.$retryAfterText"
+    Append-ActivityLog "Transient $($Entry.Method) failure on attempt $($Entry.Attempt)/$($Entry.MaxAttempts) ($statusText). Retrying in $delayText.$retryAfterText"
 }
 
 $script:gcApiRetryLogAction = {
@@ -1296,7 +1342,7 @@ function Resolve-SelectedDateValue {
         }
     }
 
-    return [DateTime]::Today
+    return Get-BusinessToday
 }
 
 function Resolve-TimeOfDayValue {
@@ -1331,25 +1377,27 @@ function Resolve-IntervalSelection {
     $startTime = Resolve-TimeOfDayValue -Text ([string]$startTimeTextBox.Text) -DefaultValue ([TimeSpan]::Zero) -Label 'Start time'
     $endTime = Resolve-TimeOfDayValue -Text ([string]$endTimeTextBox.Text) -DefaultValue ([TimeSpan]::new(23, 59, 59)) -Label 'End time'
 
-    $startLocal = $startDate.Date.Add($startTime)
-    $endLocal = $endDate.Date.Add($endTime)
-    if ($endLocal -le $startLocal) {
+    # The pickers hold US Eastern wall-clock times (business HQ), whatever the machine's zone is.
+    # Genesys Cloud stores conversationStart/conversationEnd in UTC, so the interval is sent in UTC.
+    $startEastern = $startDate.Date.Add($startTime)
+    $endEastern = $endDate.Date.Add($endTime)
+    if ($endEastern -le $startEastern) {
         throw "End date/time must be after start date/time."
     }
 
-    $startUtc = [DateTime]::SpecifyKind($startLocal, [System.DateTimeKind]::Local).ToUniversalTime()
-    $endUtc = [DateTime]::SpecifyKind($endLocal, [System.DateTimeKind]::Local).ToUniversalTime()
+    $startUtc = ConvertFrom-BusinessTime $startEastern
+    $endUtc = ConvertFrom-BusinessTime $endEastern
 
     return [pscustomobject]@{
-        StartDate  = $startDate
-        EndDate    = $endDate
-        StartTime  = $startTime
-        EndTime    = $endTime
-        StartLocal = $startLocal
-        EndLocal   = $endLocal
-        StartUtc   = $startUtc
-        EndUtc     = $endUtc
-        Interval   = "$($startUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))/$($endUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))"
+        StartDate    = $startDate
+        EndDate      = $endDate
+        StartTime    = $startTime
+        EndTime      = $endTime
+        StartEastern = $startEastern
+        EndEastern   = $endEastern
+        StartUtc     = $startUtc
+        EndUtc       = $endUtc
+        Interval     = "$($startUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))/$($endUtc.ToString('yyyy-MM-ddTHH:mm:ss.fffZ'))"
     }
 }
 
@@ -1408,6 +1456,7 @@ function Test-RegionValue {
 function Build-QueryBody {
     $intervalSelection = Resolve-IntervalSelection
     Set-IntervalControlDefaults -Resolved $intervalSelection
+    $intervalUtcText.Text = "Sent as UTC: $($intervalSelection.Interval)  ($(Get-BusinessTimeZoneLabel -UtcValue $intervalSelection.StartUtc))"
     $body = [ordered]@{
         interval = $intervalSelection.Interval
         order    = Get-ComboValue $orderCombo
@@ -1474,9 +1523,10 @@ function Build-QueryBody {
 }
 
 function Build-QueryRequestPreview {
-    # Validates and resolves the region from the UI control, then builds both the
-    # endpoint URI and the request body.  Also syncs $script:baseUri so the submit
-    # path always targets the same endpoint that was shown in the preview.
+    # Validates and resolves the region from the UI control, then builds the endpoint URI,
+    # the query body, and the execution plan (7-day windows, page size). Also syncs
+    # $script:baseUri so Run Query always targets the same endpoint shown in the preview.
+    # BodyJson is the first page request exactly as it will be sent.
     $body = Build-QueryBody
 
     $region = ([string]$regionComboBox.Text).Trim()
@@ -1486,13 +1536,20 @@ function Build-QueryRequestPreview {
         throw "Invalid region '$region'. Region must be a valid hostname (e.g. 'usw2.pure.cloud' or 'mypurecloud.com')."
     }
 
-    # Keep the API base URI in sync so submit uses the same region shown in preview
+    # Keep the API base URI in sync so the query uses the same region shown in preview
     $script:baseUri = "https://api.$region"
 
+    $startOfDay = [bool]$startOfDayCheckBox.IsChecked
+    $plan = Get-ConversationDetailQueryPlan -Body $body -PageSize $script:queryPageSize -MaxWindowDays $script:queryMaxWindowDays
+    $firstPage = New-ConversationDetailQueryPageBody -Body $body -Interval $plan.Windows[0].Interval -PageSize $plan.PageSize -PageNumber 1
+
     return [pscustomobject]@{
-        EndpointUri = "$($script:baseUri)/api/v2/analytics/conversations/details/jobs"
-        Body        = $body
-        BodyJson    = ($body | ConvertTo-Json -Depth 10)
+        EndpointUri        = "$($script:baseUri)$($script:CdqPath)"
+        Body               = $body
+        BodyJson           = ($firstPage | ConvertTo-Json -Depth 10)
+        Plan               = $plan
+        PlanText           = (Get-ConversationDetailQueryPlanText -Plan $plan -StartOfDayMatching $startOfDay)
+        StartOfDayMatching = $startOfDay
     }
 }
 
@@ -1696,14 +1753,21 @@ function Update-ReportView {
         if ($null -eq $Profiles) { $Profiles = @(Update-ConversationProfiles) }
         Set-Status 'Building report...'
         [System.Windows.Forms.Application]::DoEvents()
-        $script:currentReport = Get-ConversationReport -Profiles $Profiles -Lookups $script:lookups -Source $script:dataSource -QueryInterval $script:dataQueryInterval
+        $script:currentReport = Get-ConversationReport -Profiles $Profiles -Lookups $script:lookups -Source $script:dataSource -QueryInterval $script:dataQueryInterval -Thresholds (Get-ConfiguredReportThresholds)
     }
     $report = $script:currentReport
 
     $reportHeadlineText.Text = $report.Headline
     $scope = [System.Collections.Generic.List[string]]::new()
     $scope.Add("Data window: $($report.WindowStartLocal) to $($report.WindowEndLocal) ($($report.TimeZone))") | Out-Null
-    if ($report.QueryInterval) { $scope.Add("Query interval (UTC): $($report.QueryInterval)") | Out-Null }
+    if ($report.QueryInterval) {
+        $line = "Query interval (UTC): $($report.QueryInterval)"
+        $window = ConvertFrom-IntervalString $report.QueryInterval
+        if ($null -ne $window) {
+            $line += " = $((ConvertTo-BusinessTime $window.StartUtc).ToString('yyyy-MM-dd HH:mm:ss')) to $((ConvertTo-BusinessTime $window.EndUtc).ToString('yyyy-MM-dd HH:mm:ss')) US Eastern"
+        }
+        $scope.Add($line) | Out-Null
+    }
     if ($report.Source) { $scope.Add("Source: $($report.Source)") | Out-Null }
     $scope.Add("Generated: $($report.GeneratedLocal)") | Out-Null
     $scope.Add($report.Units) | Out-Null
@@ -1804,7 +1868,7 @@ function Update-ReferenceLookups {
     param([switch]$Force)
 
     if ([string]::IsNullOrWhiteSpace($script:accessToken)) {
-        Append-JobLog 'Name lookup skipped: not authenticated. IDs are shown instead of names.'
+        Append-ActivityLog 'Name lookup skipped: not authenticated. IDs are shown instead of names.'
         return $false
     }
 
@@ -1855,11 +1919,11 @@ function Update-OrgReferenceLookups {
             }
             $script:lookups[$source.Kind] = $map
             $loadedAny = $true
-            Append-JobLog "Name lookup: loaded $($map.Count) $($source.Label)."
+            Append-ActivityLog "Name lookup: loaded $($map.Count) $($source.Label)."
         }
         catch {
             $failureText = Format-UiApiFailure -Exception $_.Exception
-            Append-JobLog "Name lookup for $($source.Label) failed; IDs will be shown instead. $failureText"
+            Append-ActivityLog "Name lookup for $($source.Label) failed; IDs will be shown instead. $failureText"
         }
     }
 
@@ -1909,95 +1973,12 @@ function Update-UserLookups {
         }
         catch {
             $failureText = Format-UiApiFailure -Exception $_.Exception
-            Append-JobLog "Name lookup for users (batch $batchNumber of $batchCount) failed; IDs will be shown instead. $failureText"
+            Append-ActivityLog "Name lookup for users (batch $batchNumber of $batchCount) failed; IDs will be shown instead. $failureText"
         }
     }
-    Append-JobLog "Name lookup: resolved $($result.Resolved) of $($result.Requested) users."
+    Append-ActivityLog "Name lookup: resolved $($result.Resolved) of $($result.Requested) users."
     return $result
 }
-
-# -----------------------------------------------------------------------------
-# DispatcherTimer (job polling - runs on UI thread, no runspace needed)
-# -----------------------------------------------------------------------------
-
-$script:pollTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:pollTimer.Interval = [TimeSpan]::FromSeconds(3)
-
-$script:pollTimer.Add_Tick({
-        # -- Check guardrails before making the API call --
-        $elapsed = [DateTime]::UtcNow - $script:jobSubmitTime
-        $jobElapsedLabel.Text = $elapsed.ToString('mm\:ss')
-
-        if ($script:pollCount -ge $script:maxPollCount) {
-            $script:pollTimer.Stop()
-            $cancelJobBtn.IsEnabled = $false
-            $jobStateLabel.Text = 'STOPPED'
-            $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
-            Append-JobLog "Polling stopped: reached max poll count ($($script:maxPollCount))."
-            $collectStatusText.Text = "Polling stopped after $($script:maxPollCount) attempts. Cancel the job or try collecting manually if it completed."
-            Set-Status 'Polling stopped - max poll count reached.'
-            return
-        }
-
-        if ($elapsed.TotalMinutes -ge $script:maxPollTimeoutMinutes) {
-            $script:pollTimer.Stop()
-            $cancelJobBtn.IsEnabled = $false
-            $jobStateLabel.Text = 'TIMEOUT'
-            $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
-            Append-JobLog "Polling stopped: timeout after $($script:maxPollTimeoutMinutes) minutes."
-            $collectStatusText.Text = "Polling timed out after $($script:maxPollTimeoutMinutes) min. Cancel the job or try collecting manually if it completed."
-            Set-Status 'Polling stopped - timeout.'
-            return
-        }
-
-        try {
-            $status = Get-AnalyticsJobStatus -JobId $script:currentJobId
-            $state = [string]$status.state
-
-            $script:pollCount++
-            $script:consecutivePollErrors = 0
-            $jobStateLabel.Text = $state
-            $jobPollLabel.Text = [string]$script:pollCount
-
-            Append-JobLog "Poll $($script:pollCount): state=$state"
-
-            if ($state -in @('FULFILLED', 'FAILED', 'CANCELLED')) {
-                $script:pollTimer.Stop()
-                $cancelJobBtn.IsEnabled = $false
-
-                if ($state -eq 'FULFILLED') {
-                    $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkGreen
-                    $collectResultsBtn.IsEnabled = $true
-                    $collectStatusText.Text = "Job FULFILLED! Click 'Collect All Results' to page through and load all conversations."
-                    Append-JobLog "Job complete. Ready to collect results."
-                    Set-Status "Job $($script:currentJobId) fulfilled - click Collect."
-                }
-                else {
-                    $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
-                    $collectStatusText.Text = "Job ended in state: $state. Submit a new job."
-                    Append-JobLog "Job ended with non-success state: $state"
-                    Set-Status "Job $state - check log."
-                }
-            }
-            else {
-                $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkOrange
-            }
-        }
-        catch {
-            $script:consecutivePollErrors++
-            $failureText = Format-UiApiFailure -Exception $_.Exception
-            Append-JobLog "Poll error ($($script:consecutivePollErrors)/$($script:maxConsecutivePollErrors)): $failureText"
-
-            if ($script:consecutivePollErrors -ge $script:maxConsecutivePollErrors) {
-                $script:pollTimer.Stop()
-                $jobStateLabel.Text = 'ERROR'
-                $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
-                $collectResultsBtn.IsEnabled = $false
-                $collectStatusText.Text = "Polling stopped after $($script:maxConsecutivePollErrors) consecutive errors. Review the activity log."
-                Set-Status 'Polling stopped - too many consecutive errors.'
-            }
-        }
-    })
 
 # -----------------------------------------------------------------------------
 # Event handlers
@@ -2058,10 +2039,10 @@ $authButton.Add_Click({
                 if ($null -ne $prior -and -not [string]::IsNullOrWhiteSpace($prior.RefreshToken) -and $prior.Region -eq $region -and $prior.ClientId -eq $clientId) {
                     try {
                         $tokenRecord = Invoke-PkceTokenRefresh -Region $region -ClientId $clientId -RefreshToken $prior.RefreshToken
-                        Append-JobLog 'Token refreshed silently.'
+                        Append-ActivityLog 'Token refreshed silently.'
                     }
                     catch {
-                        Append-JobLog "Silent refresh failed ($($_.Exception.Message)); starting browser sign-in."
+                        Append-ActivityLog "Silent refresh failed ($($_.Exception.Message)); starting browser sign-in."
                         $tokenRecord = $null
                     }
                 }
@@ -2071,7 +2052,7 @@ $authButton.Add_Click({
                     $authStatusLabel.Text = 'Waiting for browser...'
                     $tokenRecord = Invoke-PkceLogin -Region $region -ClientId $clientId -RedirectUri $redirectUri `
                         -Scope $script:authSettings.Scope -TimeoutSeconds $script:PkceLoginTimeoutSeconds `
-                        -Log { param($m) Append-JobLog $m } `
+                        -Log { param($m) Append-ActivityLog $m } `
                         -PumpAction { [System.Windows.Threading.Dispatcher]::CurrentDispatcher.Invoke([Action] {}, [System.Windows.Threading.DispatcherPriority]::Background) } `
                         -CancelCheck { -not $window.IsLoaded } `
                         -ManualCodePrompt {
@@ -2100,13 +2081,13 @@ $authButton.Add_Click({
             $authStatusLabel.Foreground = [System.Windows.Media.Brushes]::DarkGreen
             Save-GenesysEnvConfig -Region $region -ClientId $clientId -RedirectUri $redirectUri -AuthMode $authMode -Scope $script:authSettings.Scope
             Set-Status "Authenticated - $region$expiryNote."
-            Append-JobLog "Authenticated to $region via $authMode$expiryNote."
+            Append-ActivityLog "Authenticated to $region via $authMode$expiryNote."
         }
         catch {
             $authStatusLabel.Text = 'Failed'
             $authStatusLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
             Set-Status "Authentication failed."
-            Append-JobLog "Authentication failed: $($_.Exception.Message)"
+            Append-ActivityLog "Authentication failed: $($_.Exception.Message)"
             if ($window.IsLoaded) {
                 [System.Windows.MessageBox]::Show("Authentication failed:`n$($_.Exception.Message)", 'Auth Error', 'OK', 'Error') | Out-Null
             }
@@ -2122,6 +2103,7 @@ function Set-DatePreset {
     # Presets always apply the canonical full-day range: 00:00:00 start, 23:59:59 end.
     # Times are set unconditionally so each preset produces a deterministic interval
     # regardless of any value previously typed into the time boxes.
+    # Dates are US Eastern calendar dates (see Resolve-IntervalSelection).
     param([DateTime]$Start, [DateTime]$End)
     $startDatePicker.SelectedDate = $Start
     $endDatePicker.SelectedDate = $End
@@ -2130,24 +2112,24 @@ function Set-DatePreset {
 }
 
 (Get-Control 'PresetToday').Add_Click({
-        $t = [DateTime]::Today; Set-DatePreset -Start $t -End $t
+        $t = Get-BusinessToday; Set-DatePreset -Start $t -End $t
     })
 (Get-Control 'PresetYesterday').Add_Click({
-        $y = [DateTime]::Today.AddDays(-1); Set-DatePreset -Start $y -End $y
+        $y = (Get-BusinessToday).AddDays(-1); Set-DatePreset -Start $y -End $y
     })
 (Get-Control 'PresetLast7').Add_Click({
-        Set-DatePreset -Start ([DateTime]::Today.AddDays(-6)) -End ([DateTime]::Today)
+        $t = Get-BusinessToday; Set-DatePreset -Start $t.AddDays(-6) -End $t
     })
 (Get-Control 'PresetLast30').Add_Click({
-        Set-DatePreset -Start ([DateTime]::Today.AddDays(-29)) -End ([DateTime]::Today)
+        $t = Get-BusinessToday; Set-DatePreset -Start $t.AddDays(-29) -End $t
     })
 (Get-Control 'PresetThisMonth').Add_Click({
-        $now = [DateTime]::Today
+        $now = Get-BusinessToday
         $s = [DateTime]::new($now.Year, $now.Month, 1)
         Set-DatePreset -Start $s -End $now
     })
 (Get-Control 'PresetLastMonth').Add_Click({
-        $now = [DateTime]::Today
+        $now = Get-BusinessToday
         $s = [DateTime]::new($now.Year, $now.Month, 1).AddMonths(-1)
         $e = [DateTime]::new($now.Year, $now.Month, 1).AddDays(-1)
         Set-DatePreset -Start $s -End $e
@@ -2224,171 +2206,195 @@ $stack
         }
     })
 
-# -- Submit job ----------------------------------------------------------------
+# -- Run query (paged, on the UI thread) ---------------------------------------
 
-$submitJobBtn.Add_Click({
+function Set-QueryMonitorState {
+    param([string]$State, [System.Windows.Media.Brush]$Brush)
+    $queryStateLabel.Text = $State
+    $queryStateLabel.Foreground = $Brush
+}
+
+function Update-QueryMonitorProgress {
+    param([pscustomobject]$Info)
+    $queryWindowLabel.Text = "$($Info.WindowIndex)/$($Info.WindowCount)"
+    $queryPagesLabel.Text = [string]$Info.PagesRead
+    $queryRowsLabel.Text = [string]$script:allConversations.Count
+    if ($null -ne $script:queryStartTime) { $queryElapsedLabel.Text = ([DateTime]::UtcNow - $script:queryStartTime).ToString('mm\:ss') }
+}
+
+$runQueryBtn.Add_Click({
         if ([string]::IsNullOrWhiteSpace($script:accessToken)) {
             [System.Windows.MessageBox]::Show('Please authenticate first.', 'Not Authenticated', 'OK', 'Warning') | Out-Null
             return
         }
+        if ($script:queryRunning) { Set-Status 'A query is already running.'; return }
 
         try {
             $preview = Build-QueryRequestPreview
-            $body = $preview.Body
-            $jsonBody = $preview.BodyJson
-
-            $requestEndpointBox.Text = $preview.EndpointUri
-            $queryPreviewBox.Text = $jsonBody
-
-            Append-JobLog "Submitting job..."
-            Append-JobLog "Endpoint: $($preview.EndpointUri)"
-            Append-JobLog "Body: $jsonBody"
-            Set-Status 'Submitting job...'
-
-            $result = Submit-AnalyticsJob -JsonBody $jsonBody
-            $jobId = [string]$result.jobId
-
-            if ([string]::IsNullOrWhiteSpace($jobId)) { throw "No jobId in response." }
-
-            $script:currentJobId = $jobId
-            $script:currentJobInterval = [string]$body['interval']
-            $script:pollCount = 0
-            $script:consecutivePollErrors = 0
-            $script:jobSubmitTime = [DateTime]::UtcNow
-
-            $jobIdBox.Text = $jobId
-            $jobStateLabel.Text = [string]$result.state
-            $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkOrange
-            $jobPollLabel.Text = '0'
-            $jobElapsedLabel.Text = '00:00'
-            $cancelJobBtn.IsEnabled = $true
-            $collectResultsBtn.IsEnabled = $false
-            $collectStatusText.Text = 'Job submitted. Polling for completion...'
-
-            Append-JobLog "Job submitted: $jobId  (initial state: $($result.state))"
-            Set-Status "Job $jobId submitted - polling..."
-
-            # Switch to Job Monitor tab
-            $mainTabControl.SelectedIndex = 1
-
-            $script:pollTimer.Start()
         }
         catch {
-            $failureText = Format-UiApiFailure -Exception $_.Exception
-            [System.Windows.MessageBox]::Show("Submit failed:`n$failureText", 'Submit Error', 'OK', 'Error') | Out-Null
-            Set-Status "Job submit failed."
-            Append-JobLog "Submit error: $failureText"
+            [System.Windows.MessageBox]::Show("The query could not be built:`n$($_.Exception.Message)", 'Query Error', 'OK', 'Error') | Out-Null
+            Set-Status 'Query not started.'
+            return
         }
-    })
+        $body = $preview.Body
+        $requestEndpointBox.Text = $preview.EndpointUri
+        $queryPreviewBox.Text = $preview.BodyJson
+        $queryPlanText.Text = $preview.PlanText
 
-# -- Cancel job ----------------------------------------------------------------
+        $script:queryRunning = $true
+        $script:queryStopRequested = $false
+        $script:queryStartTime = [DateTime]::UtcNow
+        $script:queryDroppedByStartOfDay = 0
+        $script:queryLastPagesRead = 0
+        $script:currentQueryInterval = [string]$body['interval']
+        $script:currentQueryStartOfDayMatching = [bool]$preview.StartOfDayMatching
 
-$cancelJobBtn.Add_Click({
-        if ([string]::IsNullOrWhiteSpace($script:currentJobId)) { return }
-        $r = [System.Windows.MessageBox]::Show(
-            "Delete/cancel job $($script:currentJobId)?", 'Confirm Cancel', 'YesNo', 'Question')
-        if ($r -ne 'Yes') { return }
-
-        $script:pollTimer.Stop()
-        $deleteSucceeded = Remove-AnalyticsJob -JobId $script:currentJobId
-        $collectResultsBtn.IsEnabled = $false
-        if ($deleteSucceeded) {
-            Append-JobLog "Job $($script:currentJobId) cancelled/deleted."
-            $jobStateLabel.Text = 'CANCELLED'
-            $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
-            $cancelJobBtn.IsEnabled = $false
-            $collectStatusText.Text = 'Job cancelled. Submit a new job.'
-            Set-Status 'Job cancelled.'
-        }
-        else {
-            $jobStateLabel.Text = 'DELETE FAILED'
-            $jobStateLabel.Foreground = [System.Windows.Media.Brushes]::DarkRed
-            $cancelJobBtn.IsEnabled = $true
-            $collectStatusText.Text = 'Delete request failed. The remote job may still exist; review the activity log.'
-            Set-Status 'Job delete failed - see log.'
-            [System.Windows.MessageBox]::Show("Delete/cancel failed. The local poller was stopped, but the remote job may still exist.`nSee the activity log for details.", 'Cancel Error', 'OK', 'Warning') | Out-Null
-        }
-    })
-
-# -- Collect results -----------------------------------------------------------
-
-$collectResultsBtn.Add_Click({
-        $collectResultsBtn.IsEnabled = $false
         Clear-ConversationStore
-        $script:seenCursors = [System.Collections.Generic.HashSet[string]]::new()
-        $cursor = $null
-        $page = 0
+        $queryIntervalBox.Text = $script:currentQueryInterval
+        Set-QueryMonitorState -State 'RUNNING' -Brush ([System.Windows.Media.Brushes]::DarkOrange)
+        $queryWindowLabel.Text = "0/$($preview.Plan.WindowCount)"
+        $queryPagesLabel.Text = '0'
+        $queryRowsLabel.Text = '0'
+        $queryElapsedLabel.Text = '00:00'
+        $stopQueryBtn.IsEnabled = $true
+        $showResultsBtn.IsEnabled = $false
+        $runQueryBtn.IsEnabled = $false
+        $queryStatusText.Text = 'Query running. Pages are added as they arrive; click Stop Query to end early.'
 
-        Append-JobLog "Collecting results from job $($script:currentJobId)..."
-        Append-JobLog "  Guardrails: max $($script:maxPageCount) pages, cursor loop detection enabled."
-        Set-Status 'Collecting results...'
+        Append-ActivityLog 'Running paged query...'
+        Append-ActivityLog "Endpoint: $($preview.EndpointUri)"
+        Append-ActivityLog "Plan: $($preview.PlanText)"
+        Append-ActivityLog "First page body: $($preview.BodyJson)"
+        Append-ActivityLog "  Guardrails: max $($script:queryMaxPages) page requests per run; Stop Query ends the run after the page in flight."
+        Set-Status 'Query running...'
+        $mainTabControl.SelectedIndex = 1
+
+        # Callbacks run in a child scope of the handler, so progress is kept in script-scope state.
+        $onPage = {
+            param($Info)
+            $script:queryLastPagesRead = [int]$Info.PagesRead
+            $batch = @($Info.Conversations)
+            if ($script:currentQueryStartOfDayMatching -and $batch.Count -gt 0) {
+                $kept = Select-ConversationsStartedOnOrAfter -Conversations $batch -Interval $script:currentQueryInterval
+                $script:queryDroppedByStartOfDay += [int]$kept.Dropped
+                $batch = @($kept.Conversations)
+            }
+            Add-Conversations -Conversations $batch
+            Update-QueryMonitorProgress -Info $Info
+            $hitsText = if ($null -ne $Info.WindowHits) { " of $($Info.WindowHits) in this window" } else { '' }
+            Append-ActivityLog "  Window $($Info.WindowIndex)/$($Info.WindowCount) page $($Info.PageNumber): $($Info.PageRows) received$hitsText, $($Info.NewRows) new - loaded so far: $($script:allConversations.Count)"
+            Set-Status "Query running... $($script:allConversations.Count) conversations loaded (page $($Info.PagesRead))."
+            # Let the UI breathe between pages (also lets the Stop button click through)
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        $shouldStop = { [bool]$script:queryStopRequested }
+        $request = { param([string]$Method, [string]$Path, [string]$JsonBody) Invoke-AnalyticsDetailQueryPage -Method $Method -Path $Path -JsonBody $JsonBody }
 
         try {
-            do {
-                $page++
+            $outcome = Invoke-ConversationDetailQuery -Request $request -Body $body -PageSize $script:queryPageSize -MaxWindowDays $script:queryMaxWindowDays -MaxPages $script:queryMaxPages -OnPage $onPage -ShouldStop $shouldStop
+            $count = $script:allConversations.Count
 
-                # -- Max page guard --
-                if ($page -gt $script:maxPageCount) {
-                    Append-JobLog "Collection stopped: reached max page count ($($script:maxPageCount))."
-                    [System.Windows.MessageBox]::Show(
-                        "Collection stopped after $($script:maxPageCount) pages ($($script:allConversations.Count) conversations collected).`nThis is a safety limit. Results collected so far are available in the Results tab.",
-                        'Page Limit Reached', 'OK', 'Warning') | Out-Null
-                    break
-                }
+            if ($outcome.Stopped) {
+                Set-QueryMonitorState -State 'STOPPED' -Brush ([System.Windows.Media.Brushes]::DarkRed)
+                Append-ActivityLog "Query stopped by user after $($outcome.PagesRead) page(s); $count conversation(s) loaded."
+                $queryStatusText.Text = "Query stopped. The $count conversations loaded so far are in the Results tab."
+                $script:dataSource = "Analytics query $($script:currentQueryInterval) (stopped after page $($outcome.PagesRead))"
+            }
+            elseif ($outcome.Truncated) {
+                Set-QueryMonitorState -State 'PAGE LIMIT' -Brush ([System.Windows.Media.Brushes]::DarkRed)
+                Append-ActivityLog "Query stopped: reached max page count ($($script:queryMaxPages))."
+                [System.Windows.MessageBox]::Show(
+                    "Query stopped after $($script:queryMaxPages) pages ($count conversations loaded).`nThis is a safety limit. Narrow the interval or filters to see everything.",
+                    'Page Limit Reached', 'OK', 'Warning') | Out-Null
+                $queryStatusText.Text = "Page limit reached. The $count conversations loaded are in the Results tab."
+                $script:dataSource = "Analytics query $($script:currentQueryInterval) (partial: page limit)"
+            }
+            else {
+                Set-QueryMonitorState -State 'COMPLETE' -Brush ([System.Windows.Media.Brushes]::DarkGreen)
+                $hitsText = if ($null -ne $outcome.TotalHits) { " The API reported $($outcome.TotalHits) hit(s) across $($outcome.WindowsCompleted) window(s)." } else { '' }
+                $dupText = if ($outcome.Duplicates -gt 0) { " $($outcome.Duplicates) duplicate(s) that straddled a window boundary were merged." } else { '' }
+                Append-ActivityLog "Query complete. $count conversation(s) loaded across $($outcome.PagesRead) page(s).$hitsText$dupText"
+                $queryStatusText.Text = "Query complete: $count conversations loaded."
+                $script:dataSource = "Analytics query $($script:currentQueryInterval)"
+            }
+            if ($script:currentQueryStartOfDayMatching) {
+                Append-ActivityLog "Start-of-day filter: dropped $($script:queryDroppedByStartOfDay) conversation(s) that started before 00:00 UTC of the interval start date."
+            }
+            Set-Status "Query finished: $count conversations loaded."
+            Write-IntervalCoverageLog -Interval $script:currentQueryInterval
 
-                Append-JobLog "  Page $page - cursor: $(if ($cursor) { $cursor.Substring(0, [Math]::Min(20,$cursor.Length)) + '...' } else { '(first)' })"
-
-                $result = Get-AnalyticsJobResults -JobId $script:currentJobId -PageSize 1000 -Cursor $cursor
-                $batch = @($result.conversations)
-                Add-Conversations -Conversations $batch
-                $cursor = [string]$result.cursor
-                Append-JobLog "  Got $($batch.Count) - total so far: $($script:allConversations.Count)"
-                Set-Status "Collecting... $($script:allConversations.Count) conversations so far (page $page)."
-
-                # -- Cursor loop detection --
-                if (-not [string]::IsNullOrWhiteSpace($cursor)) {
-                    if (-not $script:seenCursors.Add($cursor)) {
-                        Append-JobLog "Collection stopped: cursor loop detected (cursor repeated on page $page)."
-                        [System.Windows.MessageBox]::Show(
-                            "Collection stopped: the API returned a cursor that was already seen, indicating a loop.`n$($script:allConversations.Count) conversations collected so far are available in the Results tab.",
-                            'Cursor Loop Detected', 'OK', 'Warning') | Out-Null
-                        break
-                    }
-                }
-
-                # Let the UI breathe between pages
-                [System.Windows.Forms.Application]::DoEvents()
-            } while (-not [string]::IsNullOrWhiteSpace($cursor))
-
-            Append-JobLog "Collection complete. $($script:allConversations.Count) total conversations across $page pages."
-            Set-Status "Collection complete: $($script:allConversations.Count) conversations."
-
-            $script:dataSource = "Analytics job $($script:currentJobId)"
-            $script:dataQueryInterval = $script:currentJobInterval
+            $script:dataQueryInterval = $script:currentQueryInterval
             Update-ReferenceLookups | Out-Null
             Show-Results
             $mainTabControl.SelectedIndex = 2
         }
         catch {
             $failureText = Format-UiApiFailure -Exception $_.Exception
-            Append-JobLog "Collection error on page $($page): $failureText"
-            Set-Status 'Collection error - see log.'
-            [System.Windows.MessageBox]::Show("Collection failed on page $($page):`n$failureText", 'Error', 'OK', 'Error') | Out-Null
+            $failedPage = $script:queryLastPagesRead + 1
+            Set-QueryMonitorState -State 'ERROR' -Brush ([System.Windows.Media.Brushes]::DarkRed)
+            Append-ActivityLog "Query error on page request $($failedPage): $failureText"
+            Set-Status 'Query error - see log.'
+            $queryStatusText.Text = "Query failed on page request $failedPage. Review the activity log."
+            [System.Windows.MessageBox]::Show("Query failed on page request $($failedPage):`n$failureText", 'Query Error', 'OK', 'Error') | Out-Null
 
-            # Show partial results if any were collected before the error
+            # Show partial results if any pages arrived before the error
             if ($script:allConversations.Count -gt 0) {
-                Append-JobLog "Showing $($script:allConversations.Count) partial results collected before failure."
-                $script:dataSource = "Analytics job $($script:currentJobId) (partial: failed on page $page)"
-                $script:dataQueryInterval = $script:currentJobInterval
+                Append-ActivityLog "Showing $($script:allConversations.Count) partial results loaded before the failure."
+                Write-IntervalCoverageLog -Interval $script:currentQueryInterval
+                $script:dataSource = "Analytics query $($script:currentQueryInterval) (partial: failed on page request $failedPage)"
+                $script:dataQueryInterval = $script:currentQueryInterval
                 Show-Results
                 $mainTabControl.SelectedIndex = 2
             }
         }
         finally {
-            $script:seenCursors = $null
-            $collectResultsBtn.IsEnabled = $true
+            $script:queryRunning = $false
+            $script:queryStopRequested = $false
+            $stopQueryBtn.IsEnabled = $false
+            $runQueryBtn.IsEnabled = $true
+            $showResultsBtn.IsEnabled = ($script:allConversations.Count -gt 0)
+            if ($null -ne $script:queryStartTime) { $queryElapsedLabel.Text = ([DateTime]::UtcNow - $script:queryStartTime).ToString('mm\:ss') }
         }
     })
+
+$stopQueryBtn.Add_Click({
+        if (-not $script:queryRunning) { return }
+        $script:queryStopRequested = $true
+        $stopQueryBtn.IsEnabled = $false
+        Append-ActivityLog 'Stop requested; the query ends after the page in flight.'
+        Set-Status 'Stopping query...'
+    })
+
+$showResultsBtn.Add_Click({ $mainTabControl.SelectedIndex = 2 })
+
+# -- Interval coverage log --------------------------------------------------------
+
+function Write-IntervalCoverageLog {
+    # Logs how the collected conversationStart values relate to the requested interval so a
+    # result set that reaches back before the interval (overlap matching) is visible at once.
+    param([AllowNull()][string]$Interval)
+    if ([string]::IsNullOrWhiteSpace($Interval) -or $script:allConversations.Count -eq 0) { return }
+    try {
+        $cov = Get-ConversationIntervalCoverage -Conversations @($script:allConversations) -Interval $Interval
+        $fmt = 'yyyy-MM-dd HH:mm:ss'
+        Append-ActivityLog ("Interval check (conversationStart vs. query interval, UTC): {0} inside, {1} started before, {2} started after, {3} without a start." -f $cov.Inside, $cov.StartedBefore, $cov.StartedAfter, $cov.MissingStart)
+        if ($null -ne $cov.EarliestStartUtc) {
+            Append-ActivityLog ("  Earliest start: {0} UTC ({1} Eastern); latest start: {2} UTC ({3} Eastern)." -f $cov.EarliestStartUtc.ToString($fmt), (ConvertTo-BusinessTime $cov.EarliestStartUtc).ToString($fmt), $cov.LatestStartUtc.ToString($fmt), (ConvertTo-BusinessTime $cov.LatestStartUtc).ToString($fmt))
+        }
+        if ($cov.StartedBefore -gt 0) {
+            if ($script:currentQueryStartOfDayMatching) {
+                Append-ActivityLog "  $($cov.StartedBefore) conversation(s) started before the interval start time but on/after 00:00 UTC of its start date (startOfDayIntervalMatching cuts at the UTC date, not the exact time)."
+            }
+            else {
+                Append-ActivityLog "  $($cov.StartedBefore) conversation(s) started before the interval. They overlap it (a segment falls inside); tick 'startOfDayIntervalMatching' in the Query Builder to exclude them."
+            }
+        }
+    }
+    catch {
+        Append-ActivityLog "Interval check skipped: $($_.Exception.Message)"
+    }
+}
 
 # -- Results grid selection ----------------------------------------------------
 
@@ -2633,6 +2639,7 @@ $loadJsonlBtn.Add_Click({
 
             $errorSuffix = if ($loadResult.ErrorCount -gt 0) { " ($($loadResult.ErrorCount) lines skipped)" } else { '' }
             Set-Status "Loaded $($script:allConversations.Count) conversations from file.$errorSuffix"
+            $showResultsBtn.IsEnabled = ($script:allConversations.Count -gt 0)
         }
         catch {
             [System.Windows.MessageBox]::Show("Load failed:`n$($_.Exception.Message)", 'Load Error', 'OK', 'Error') | Out-Null
@@ -2647,6 +2654,7 @@ $clearResultsBtn.Add_Click({
         $resultsGrid.ItemsSource = $null
         $resultsGrid.Columns.Clear()
         $summaryText.Text = 'Results cleared.'
+        $showResultsBtn.IsEnabled = $false
         $overviewPanel.Children.Clear()
         foreach ($detailGrid in @($attributesGrid, $participantsGrid, $segmentsGrid, $metricsGrid, $flowsGrid)) { Set-GridRows -Grid $detailGrid -Rows $null }
         $rawJsonBox.Text = ''
@@ -2668,7 +2676,7 @@ $resolveNamesBtn.Add_Click({
             $loaded = Update-ReferenceLookups -Force
             if ($script:allConversations.Count -gt 0) { Show-Results }
             if (-not $loaded) {
-                [System.Windows.MessageBox]::Show('No reference names could be loaded. See the Job Monitor activity log for the API errors (often a missing permission).', 'Resolve Names', 'OK', 'Warning') | Out-Null
+                [System.Windows.MessageBox]::Show('No reference names could be loaded. See the Query Monitor activity log for the API errors (often a missing permission).', 'Resolve Names', 'OK', 'Warning') | Out-Null
             }
         }
         finally { $resolveNamesBtn.IsEnabled = $true }
@@ -2791,7 +2799,7 @@ function Show-CampaignStatus {
     foreach ($group in @($status | ForEach-Object { $_.Group } | Select-Object -Unique)) {
         Add-CampaignTileGroup -Panel $campaignStatusPanel -Title $group -Tiles @($status | Where-Object { $_.Group -eq $group })
     }
-    if ($config.Count -eq 0 -and $status.Count -eq 0) { Add-CampaignNote -Panel $campaignStatusPanel -Text 'No status data was returned. See the Job Monitor activity log for the API errors.' }
+    if ($config.Count -eq 0 -and $status.Count -eq 0) { Add-CampaignNote -Panel $campaignStatusPanel -Text 'No status data was returned. See the Query Monitor activity log for the API errors.' }
     $campaignRawJsonBox.Text = ($Snapshot | Select-Object CampaignId, MediaKind, FetchedAt, Sources, Errors, Detail, Progress, Stats, Diagnostics, Summary | ConvertTo-Json -Depth 20)
 }
 
@@ -2806,12 +2814,12 @@ $loadCampaignsBtn.Add_Click({
             Update-CampaignGrid
             Show-CampaignSelection
             $note = if ($result.Truncated) { " List truncated after $($result.PagesRead) pages." } else { '' }
-            Append-JobLog "Campaigns: loaded $($script:campaignRows.Count) from /api/v2/outbound/campaigns/all ($($result.PagesRead) page(s)).$note"
+            Append-ActivityLog "Campaigns: loaded $($script:campaignRows.Count) from /api/v2/outbound/campaigns/all ($($result.PagesRead) page(s)).$note"
             Set-Status "Loaded $($script:campaignRows.Count) campaign(s).$note"
         }
         catch {
             $failureText = Format-UiApiFailure -Exception $_.Exception
-            Append-JobLog "Campaign list failed: $failureText"
+            Append-ActivityLog "Campaign list failed: $failureText"
             Set-Status 'Campaign list failed.'
             $campaignListStatusText.Text = "Load failed: $failureText"
             [System.Windows.MessageBox]::Show("Could not load campaigns:`n$failureText", 'Load Campaigns', 'OK', 'Error') | Out-Null
@@ -2839,14 +2847,14 @@ $campaignStatusBtn.Add_Click({
                 -OnProgress { param($n) Set-Status "Campaign '$($script:campaignBusyName)': fetching $n..."; Invoke-CampaignUiPump }
             $script:campaignSnapshot = $snapshot
             Show-CampaignStatus -Snapshot $snapshot
-            foreach ($e in @($snapshot.Errors)) { Append-JobLog "Campaign status: $e" }
-            Append-JobLog "Campaign status for '$($c.Name)': loaded $(@($snapshot.Sources) -join ', ')."
+            foreach ($e in @($snapshot.Errors)) { Append-ActivityLog "Campaign status: $e" }
+            Append-ActivityLog "Campaign status for '$($c.Name)': loaded $(@($snapshot.Sources) -join ', ')."
             $campaignDetailTabs.SelectedIndex = 0
             Set-Status "Campaign status refreshed for '$($c.Name)'."
         }
         catch {
             $failureText = Format-UiApiFailure -Exception $_.Exception
-            Append-JobLog "Campaign status failed: $failureText"
+            Append-ActivityLog "Campaign status failed: $failureText"
             Set-Status 'Campaign status failed.'
             [System.Windows.MessageBox]::Show("Could not load campaign status:`n$failureText", 'Refresh Status', 'OK', 'Error') | Out-Null
         }
@@ -2863,14 +2871,14 @@ $campaignRulesBtn.Add_Click({
             Set-GridRows -Grid $campaignRulesGrid -Rows @($result.Rows) -Columns $script:campaignRuleColumns
             $note = if ($result.Truncated) { " Rule list truncated after $($result.PagesRead) pages." } else { '' }
             $campaignRulesStatusText.Text = "$(@($result.Rows).Count) rule(s) reference this campaign, out of $($result.TotalRules) in the org.$note"
-            Append-JobLog "Campaign rules for '$($c.Name)': $(@($result.Rows).Count) of $($result.TotalRules) matched.$note"
+            Append-ActivityLog "Campaign rules for '$($c.Name)': $(@($result.Rows).Count) of $($result.TotalRules) matched.$note"
             $campaignDetailTabs.SelectedIndex = 1
             Set-Status 'Campaign rules loaded.'
         }
         catch {
             $failureText = Format-UiApiFailure -Exception $_.Exception
             $campaignRulesStatusText.Text = "Rules failed: $failureText"
-            Append-JobLog "Campaign rules failed: $failureText"
+            Append-ActivityLog "Campaign rules failed: $failureText"
             Set-Status 'Campaign rules failed.'
         }
         finally { Set-CampaignButtonsEnabled ($null -ne $script:selectedCampaign) }
@@ -2885,14 +2893,14 @@ $campaignEventsBtn.Add_Click({
                 -OnProgress { param($n) Set-Status "Reading outbound events (page $n)..."; Invoke-CampaignUiPump }
             Set-GridRows -Grid $campaignEventsGrid -Rows @($result.Rows) -Columns $script:campaignEventColumns
             $campaignEventsStatusText.Text = "$(@($result.Rows).Count) event(s) mention this campaign among the newest $($result.TotalEvents) org events scanned ($($result.PagesRead) page(s))."
-            Append-JobLog "Campaign events for '$($c.Name)': $(@($result.Rows).Count) of $($result.TotalEvents) scanned events matched."
+            Append-ActivityLog "Campaign events for '$($c.Name)': $(@($result.Rows).Count) of $($result.TotalEvents) scanned events matched."
             $campaignDetailTabs.SelectedIndex = 2
             Set-Status 'Campaign events loaded.'
         }
         catch {
             $failureText = Format-UiApiFailure -Exception $_.Exception
             $campaignEventsStatusText.Text = "Events failed: $failureText"
-            Append-JobLog "Campaign events failed: $failureText"
+            Append-ActivityLog "Campaign events failed: $failureText"
             Set-Status 'Campaign events failed.'
         }
         finally { Set-CampaignButtonsEnabled ($null -ne $script:selectedCampaign) }
@@ -2900,10 +2908,10 @@ $campaignEventsBtn.Add_Click({
 
 $analyzeCampaignBtn.Add_Click({
         # Bridge to the existing flow: one segment filter on outboundCampaignId plus a date window,
-        # then the user reviews the preview and submits the job from the Query Builder.
+        # then the user reviews the preview and runs the query from the Query Builder.
         $c = $script:selectedCampaign
         if ($null -eq $c) { return }
-        $spec = Get-CampaignAnalysisInterval -Campaign $c
+        $spec = Get-CampaignAnalysisInterval -Campaign $c -Today (Get-BusinessToday) -TimeZone (Get-BusinessTimeZone)
         $convFilterPanel.Children.Clear()
         $segFilterPanel.Children.Clear()
         $directionCombo.SelectedIndex = 0
@@ -2916,8 +2924,8 @@ $analyzeCampaignBtn.Add_Click({
         Set-DatePreset -Start $spec.Start -End $spec.End
         $mainTabControl.SelectedIndex = 0
         $previewBtn.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Button]::ClickEvent))
-        Append-JobLog "Campaign '$($c.Name)': Query Builder pre-filled with segment filter $($spec.Dimension) = $($spec.Value), interval $($spec.Start.ToString('yyyy-MM-dd')) to $($spec.End.ToString('yyyy-MM-dd')) ($($spec.Reason))."
-        Set-Status "Query ready for campaign '$($c.Name)' ($($spec.Reason)). Adjust the interval if needed, then Submit Async Job."
+        Append-ActivityLog "Campaign '$($c.Name)': Query Builder pre-filled with segment filter $($spec.Dimension) = $($spec.Value), interval $($spec.Start.ToString('yyyy-MM-dd')) to $($spec.End.ToString('yyyy-MM-dd')) ($($spec.Reason))."
+        Set-Status "Query ready for campaign '$($c.Name)' ($($spec.Reason)). Adjust the interval if needed, then Run Query."
     })
 
 $copyCampaignIdBtn.Add_Click({
@@ -2934,8 +2942,8 @@ $copyCampaignIdBtn.Add_Click({
 # Startup: load persisted config + auto-auth
 # -----------------------------------------------------------------------------
 
-$startDatePicker.SelectedDate = [DateTime]::Today
-$endDatePicker.SelectedDate = [DateTime]::Today
+$startDatePicker.SelectedDate = Get-BusinessToday
+$endDatePicker.SelectedDate = Get-BusinessToday
 $startTimeTextBox.Text = '00:00:00'
 $endTimeTextBox.Text = '23:59:59'
 Set-IntervalControlDefaults
@@ -2964,7 +2972,7 @@ else {
     $authStatusLabel.Text = 'Not signed in'
     $authStatusLabel.Foreground = [System.Windows.Media.Brushes]::Gray
     if ([string]::IsNullOrWhiteSpace($script:authSettings.ClientId)) {
-        Append-JobLog "No PKCE Client ID configured. Set clientId in $($script:configPath) (see GenesysConvAnalyzer.config.example.json) or in `$script:AuthDefaults."
+        Append-ActivityLog "No PKCE Client ID configured. Set clientId in $($script:configPath) (see GenesysConvAnalyzer.config.example.json) or in `$script:AuthDefaults."
     }
 }
 

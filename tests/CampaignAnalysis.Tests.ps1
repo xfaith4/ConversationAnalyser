@@ -415,4 +415,12 @@ Describe 'Get-CampaignAnalysisInterval' {
         (Get-CampaignAnalysisInterval -Campaign $none -Today $script:today).Start | Should -Be ([DateTime]::new(2026, 8, 24))
         (Get-CampaignAnalysisInterval -Campaign $none -Today $script:today -MaxDays 7).Start | Should -Be ([DateTime]::new(2026, 9, 16))
     }
+
+    It 'takes the creation calendar date in the supplied time zone' {
+        # 2026-09-11T03:30:00Z is still 2026-09-10 in US Eastern (EDT, UTC-4) but 2026-09-11 in UTC.
+        $row = ConvertTo-CampaignRow -Campaign (New-CommonCampaign -Id $script:campA -Name 'x' -Created '2026-09-11T03:30:00Z')
+        $eastern = [TimeZoneInfo]::FindSystemTimeZoneById('Eastern Standard Time')
+        (Get-CampaignAnalysisInterval -Campaign $row -Today $script:today -TimeZone $eastern).Start | Should -Be ([DateTime]::new(2026, 9, 10))
+        (Get-CampaignAnalysisInterval -Campaign $row -Today $script:today -TimeZone ([TimeZoneInfo]::Utc)).Start | Should -Be ([DateTime]::new(2026, 9, 11))
+    }
 }
